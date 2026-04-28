@@ -1,1338 +1,993 @@
-// 等待页面加载完成
-// 在DOMContentLoaded事件中添加表格样式调整
-document.addEventListener("DOMContentLoaded", function () {
-  if (window.location.hostname.includes("cnki.net")) {
-    // 添加表格左对齐样式
-    const style = document.createElement("style");
-    style.textContent = `
-          #gridTable table,
-          #gridTable th,
-          #gridTable td,
-          .result-table-list table,
-          .result-table-list th,
-          .result-table-list td {
-              text-align: left !important;
-          }
-      `;
-    document.head.appendChild(style);
+// ============================================================
+// cnki-Scholar v1.3 — 知网增强插件 (重构版)
+// 功能: PDF下载 | 摘要悬停 | 期刊标签 | 批量下载
+// ============================================================
 
-    addPdfDownloadButtons();
-    addHoverForAbstracts();
-    addDownloadAllButton();
+// ========== 常量 ==========
+
+const SELECTORS = {
+  // 文章链接（搜索结果页）
+  articleLinks: [
+    '#gridTable > div > div > div > table > tbody > tr > td.name > a.fz14',
+    '#gridTable > div > div > div > table > tbody > tr > td.name > div > a.fz14',
+    '.result-table-list tbody tr td.name a',
+  ],
+  // 期刊来源单元格（搜索结果页）
+  sourceCells: 'td.source, td.publishing, .result-table-list td.source, .s-main td.source, td[data-key=source]',
+  // 期刊名（详情页）
+  detailJournalName: '.top-tip span a',
+  detailHost: '.wx-tit',
+  // 翻页栏
+  pagesDiv: '#briefBox > div:nth-child(2) > div > div.pages',
+  // 关键词（详情页多种文献类型）
+  keywords: [
+    'body > div.wrapper > div.main > div.container > div > div:nth-child(3) > div:nth-child(4) > p.keywords',
+    'body > div.wrapper > div.main > div.container > div > div > div:nth-child(3) > div.brief > div:nth-child(4) > p',
+    'body > div.wrapper > div.main > div.container > div > div.doc-top > div:nth-child(3) > div.brief > div:nth-child(4) > p',
+    'body > div.wrapper > div.main > div.container > div.doc > div > div:nth-child(3) > div.brief > div:nth-child(3) > p',
+  ],
+};
+
+// 期刊标签配色映射
+const TAG_COLORS = {
+  cas:   { '1': '#F44336', '2': '#FF9800', '3': '#FFC107', '4': '#2196F3' },
+  jcr:   { 'Q1': '#F44336', 'Q2': '#FF9800', 'Q3': '#FFC107', 'Q4': '#2196F3' },
+  wjci:  { 'Q1': '#4CAF50', 'Q2': '#2196F3', 'Q3': '#FFC107', 'Q4': '#F44336' },
+  tag:   { '核心': '#F44336', '扩展': '#FF9800', 'EI': '#FF7043', 'SCI': '#4CAF50', 'CSSCI': '#9C27B0' },
+  wos:   '#009688',
+  top:   'rgba(156, 39, 176, 0.8)',
+  impact:'rgba(156, 39, 176, 0.8)',
+  rank:  'rgba(156, 39, 176, 0.8)',
+};
+
+// 关键词标签配色
+const KEYWORD_COLORS = [
+  ['#f0f8ff', '#6eb6ff'],  // 淡蓝
+  ['#f5fff0', '#a3d899'],  // 淡绿
+  ['#fff8f0', '#ffbe7d'],  // 淡橙
+  ['#fff5fa', '#ffa6d2'],  // 淡粉
+  ['#faf5ff', '#c59df9'],  // 淡紫
+];
+
+// 默认期刊数据（离线回退）
+const DEFAULT_JOURNALS_DATA = [
+  { title: "计算机学报",   tags: ["北大核心","EI","CSCD"],    impactFactor: "2.456", "中科院": "2", WOS: "SCIE" },
+  { title: "软件学报",     tags: ["北大核心","EI","CSCD"],    impactFactor: "1.892", "中科院": "2", WOS: "SCIE" },
+  { title: "自动化学报",   tags: ["北大核心","EI","CSCD"],    impactFactor: "3.125", "中科院": "1", WOS: "SCIE" },
+  { title: "中国科学",     tags: ["北大核心","CSCD"],         impactFactor: "4.123", "中科院": "1", WOS: "SCIE" },
+  { title: "科学通报",     tags: ["北大核心","CSCD"],         impactFactor: "3.456", "中科院": "1", WOS: "SCIE" },
+  { title: "管理世界",     tags: ["北大核心","CSSCI"],        impactFactor: "35.785" },
+  { title: "经济研究",     tags: ["北大核心","CSSCI"],        impactFactor: "20.332" },
+  { title: "中国工业经济", tags: ["北大核心","CSSCI"],        impactFactor: "32.332" },
+  { title: "社会学研究",   tags: ["北大核心","CSSCI"],        impactFactor: "8.5" },
+  { title: "法学研究",     tags: ["北大核心","CSSCI"],        impactFactor: "7.2" },
+  { title: "教育研究",     tags: ["北大核心","CSSCI"],        impactFactor: "5.8" },
+  { title: "心理科学进展", tags: ["北大核心","CSSCI","CSCD"], impactFactor: "3.5" },
+  { title: "图书情报工作", tags: ["北大核心","CSSCI"],        impactFactor: "2.8" },
+];
+
+// 期刊数据缓存
+const journalCache = {
+  data: null,
+  lastFetch: 0,
+  CACHE_DURATION: 3600000, // 1小时
+};
+
+// ========== 工具函数 ==========
+
+/**
+ * 三级期刊名匹配：精确 → 中英文变体 → 去括号模糊
+ */
+function findJournal(name, data) {
+  if (!name || !data) return null;
+  const lower = name.toLowerCase();
+
+  // 第一级：精确匹配
+  let found = data.find(j => j.title.toLowerCase() === lower);
+  if (found) return found;
+
+  // 第二级：中英文变体
+  found = data.find(j => j.title.toLowerCase() === `${lower}(中英文)`);
+  if (found) return found;
+
+  // 第三级：去括号模糊匹配
+  const base = name.replace(/[（）()]/g, '').trim().toLowerCase();
+  if (base) {
+    found = data.find(j => j.title.toLowerCase().includes(base));
   }
-});
+  return found || null;
+}
 
-// 监听动态加载的内容
-// 修改MutationObserver回调，添加processJournalTags
-// 添加防抖处理
-let processing = false;
-const observer = new MutationObserver(function (mutations) {
-  if (!processing) {
-    processing = true;
-    setTimeout(() => {
-      mutations.forEach(function (mutation) {
-        if (mutation.addedNodes.length) {
-          addPdfDownloadButtons();
-          addHoverForAbstracts();
-          addDownloadAllButton();
-          // 添加随机延迟（1-3秒）
-          setTimeout(processJournalTags, 1000 + Math.random() * 2000);
-        }
-      });
-      processing = false;
-    }, 500);
+/**
+ * 创建单个标签 DOM 元素
+ */
+function createTagEl(text, bgColor, extraStyle = {}) {
+  const el = document.createElement('span');
+  el.className = 'journal-tag';
+  el.textContent = text;
+  Object.assign(el.style, {
+    backgroundColor: bgColor,
+    ...extraStyle,
+  });
+  return el;
+}
+
+/**
+ * 根据 journalInfo 渲染所有标签到容器
+ */
+function renderJournalTags(journalInfo, tagContainer) {
+  if (!journalInfo) return;
+
+  // 中文影响因子
+  if (journalInfo.impactFactor && journalInfo.impactFactor !== 'N/A') {
+    tagContainer.appendChild(createTagEl(`IF: ${journalInfo.impactFactor}`, TAG_COLORS.impact));
   }
-});
 
-observer.observe(document.body, {
-  childList: true,
-  subtree: true,
-});
+  // JCR 影响因子
+  if (journalInfo.JCR_IF && journalInfo.JCR_IF !== 'N/A') {
+    tagContainer.appendChild(createTagEl(`JCR IF: ${journalInfo.JCR_IF}`, TAG_COLORS.impact));
+  }
 
-// 添加PDF下载按钮（保持原有功能）
-// 修改PDF下载按钮添加函数
+  // 复合影响因子
+  if (journalInfo.compositeImpactFactor && journalInfo.compositeImpactFactor !== 'N/A') {
+    tagContainer.appendChild(createTagEl(`复合IF: ${journalInfo.compositeImpactFactor}`, TAG_COLORS.impact));
+  }
+
+  // 排名
+  if (journalInfo.CR && journalInfo.CR !== 'N/A') {
+    tagContainer.appendChild(createTagEl(`排名: ${journalInfo.CR}`, TAG_COLORS.rank));
+  }
+
+  // 中科院分区
+  if (journalInfo['中科院']) {
+    const color = TAG_COLORS.cas[journalInfo['中科院']] || '#2196F3';
+    tagContainer.appendChild(createTagEl(`中科院 ${journalInfo['中科院']}区`, color));
+  }
+
+  // TOP
+  if (journalInfo.TOP === 'T') {
+    tagContainer.appendChild(createTagEl('Top', TAG_COLORS.top));
+  }
+
+  // JCR 分区
+  if (journalInfo.IF_Quartile && journalInfo.IF_Quartile !== 'N/A') {
+    const color = TAG_COLORS.jcr[journalInfo.IF_Quartile] || '#2196F3';
+    tagContainer.appendChild(createTagEl(`JCR ${journalInfo.IF_Quartile}`, color));
+  }
+
+  // WOS
+  if (journalInfo.WOS && journalInfo.WOS !== 'N/A') {
+    journalInfo.WOS.split(';').forEach(w => {
+      const val = w.trim();
+      if (val) tagContainer.appendChild(createTagEl(val, TAG_COLORS.wos));
+    });
+  }
+
+  // WJCI
+  if (journalInfo.wjci && journalInfo.wjci !== 'N/A') {
+    const level = journalInfo.wjci.substring(0, 2).toUpperCase();
+    const color = TAG_COLORS.wjci[level] || '#5C6BC0';
+    tagContainer.appendChild(createTagEl(`WJCI ${journalInfo.wjci}`, color));
+  }
+
+  // tags（北大核心、CSSCI、CSCD 等）
+  if (journalInfo.tags && journalInfo.tags.length > 0) {
+    // CSSCI 排前面
+    const sorted = [...journalInfo.tags].sort((a, b) => {
+      if (a.includes('CSSCI')) return -1;
+      if (b.includes('CSSCI')) return 1;
+      return 0;
+    });
+    sorted.forEach(tagText => {
+      if (!tagText || tagText === 'N/A') return;
+      let bgColor = '#5C6BC0';
+      for (const [key, color] of Object.entries(TAG_COLORS.tag)) {
+        if (tagText.includes(key)) { bgColor = color; break; }
+      }
+      tagContainer.appendChild(createTagEl(tagText, bgColor));
+    });
+  }
+}
+
+/**
+ * 获取所有可见文章链接
+ */
+function getArticleLinks() {
+  return document.querySelectorAll(SELECTORS.articleLinks);
+}
+
+// ========== PDF 单篇下载 ==========
+
 async function addPdfDownloadButtons() {
-  // 支持检索页面的文章链接选择器
-  const articleLinks = document.querySelectorAll(`
-    #gridTable > div > div > div > table > tbody > tr > td.name > a.fz14,
-    #gridTable > div > div > div > table > tbody > tr > td.name > div > a.fz14,
-    .result-table-list tbody tr td.name a
-  `);
+  const articleLinks = getArticleLinks();
 
   for (const link of articleLinks) {
-    const row = link.closest("tr");
-    if (!row || row.querySelector(".pdf-download-btn")) continue;
+    const row = link.closest('tr');
+    if (!row || row.querySelector('.pdf-download-btn')) continue;
 
-    // 创建下载按钮
-    const downloadBtn = document.createElement("button");
-    downloadBtn.className = "pdf-download-btn";
-    downloadBtn.textContent = "下载";
-    Object.assign(downloadBtn.style, {
-      marginRight: "4px",
-      padding: "1px 4px",
-      fontSize: "14px",
-      cursor: "pointer",
-      backgroundColor: "rgba(194, 194, 194, 0.5)",
-      color: "#FFF",
-      border: "none",
-      borderRadius: "4px",
-      boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-      verticalAlign: "middle",
-      whiteSpace: "nowrap",
-      display: "inline-block",
+    const downloadBtn = document.createElement('button');
+    downloadBtn.className = 'pdf-download-btn';
+    downloadBtn.textContent = '下载';
+
+    const nameCell = row.querySelector('td.name');
+    if (!nameCell) continue;
+
+    // 创建 flex 容器
+    const container = document.createElement('div');
+    Object.assign(container.style, {
+      display: 'flex',
+      alignItems: 'center',
+      flexWrap: 'wrap',
     });
 
-    // 插入到标题前面
-    const nameCell = row.querySelector("td.name");
-    if (nameCell) {
-      // 创建容器包裹按钮和标题
-      const container = document.createElement("div");
-      Object.assign(container.style, {
-        display: "flex",
-        alignItems: "center", // 改为center实现垂直居中对齐
-        flexWrap: "wrap",
+    const titleLink = nameCell.querySelector('a');
+    if (titleLink) {
+      Object.assign(titleLink.style, {
+        textAlign: 'left',
+        whiteSpace: 'normal',
+        wordBreak: 'break-word',
+        display: 'inline',
+        flex: '1',
+        minWidth: '0',
+        fontSize: '14px',
+        lineHeight: '1.2',
       });
-
-      // 处理标题链接
-      const titleLink = nameCell.querySelector("a");
-      if (titleLink) {
-        titleLink.style.textAlign = "left";
-        titleLink.style.whiteSpace = "normal";
-        titleLink.style.wordBreak = "break-word";
-        titleLink.style.display = "inline";
-        titleLink.style.flex = "1";
-        titleLink.style.minWidth = "0";
-        titleLink.style.fontSize = "14px";
-        titleLink.style.lineHeight = "1.2"; // 添加行高设置
-      }
-
-      // 清空单元格并添加新结构
-      nameCell.innerHTML = "";
-      container.appendChild(downloadBtn);
-      if (titleLink) container.appendChild(titleLink);
-
-      // 创建一个新的容器来包裹关键词容器，确保与标题对齐
-      const titleAndKeywordsWrapper = document.createElement("div");
-      titleAndKeywordsWrapper.style.cssText =
-        "display: flex; flex-direction: column; flex: 1; min-width: 0;";
-
-      // 将标题移动到这个新容器中
-      if (titleLink) {
-        container.removeChild(titleLink);
-        titleAndKeywordsWrapper.appendChild(titleLink);
-      }
-
-      // 创建关键词容器，确保与标题左对齐
-      const keywordsContainer = document.createElement("div");
-      keywordsContainer.className = "keywords-container";
-      keywordsContainer.style.cssText =
-        "display: flex; flex-wrap: wrap; margin-top: 4px; width: 100%;"; // 移除margin-left
-      titleAndKeywordsWrapper.appendChild(keywordsContainer);
-
-      // 将新容器添加到主容器中
-      container.appendChild(titleAndKeywordsWrapper);
-      nameCell.appendChild(container);
-
-      // 异步获取关键词
-      fetchKeywords(link.href, keywordsContainer);
     }
 
-    // 点击事件
-    downloadBtn.addEventListener("click", async (e) => {
+    // 标题+关键词包装
+    const titleWrap = document.createElement('div');
+    titleWrap.style.cssText = 'display:flex;flex-direction:column;flex:1;min-width:0;';
+
+    // 关键词容器
+    const keywordsContainer = document.createElement('div');
+    keywordsContainer.className = 'keywords-container';
+    keywordsContainer.style.cssText = 'display:flex;flex-wrap:wrap;margin-top:4px;width:100%;';
+
+    // 组装
+    nameCell.innerHTML = '';
+    container.appendChild(downloadBtn);
+    if (titleLink) {
+      titleWrap.appendChild(titleLink);
+    }
+    titleWrap.appendChild(keywordsContainer);
+    container.appendChild(titleWrap);
+    nameCell.appendChild(container);
+
+    // 异步获取关键词
+    fetchKeywords(link.href, keywordsContainer);
+
+    // 下载事件
+    downloadBtn.addEventListener('click', async (e) => {
       e.preventDefault();
       e.stopPropagation();
-
-      downloadBtn.textContent = "获取中...";
+      downloadBtn.textContent = '获取中...';
       downloadBtn.disabled = true;
 
       try {
-        // 修改为支持学位论文的PDF链接获取
         const pdfUrl = await fetchPdfUrl(link.href, row);
-        pdfUrl ? window.open(pdfUrl, "_blank") : alert("无法获取PDF下载链接");
+        if (pdfUrl) {
+          // 使用 chrome.downloads API（通过 background.js）
+          downloadPdf(pdfUrl);
+        } else {
+          alert('无法获取PDF下载链接');
+        }
       } catch (error) {
-        console.error("获取PDF链接失败:", error);
-        alert("获取PDF链接失败: " + error.message);
+        console.error('[cnki-Scholar] 获取PDF链接失败:', error);
+        alert('获取PDF链接失败: ' + error.message);
       } finally {
-        downloadBtn.textContent = "下载";
+        downloadBtn.textContent = '下载';
         downloadBtn.disabled = false;
       }
     });
   }
 }
 
-// 获取关键词函数
-async function fetchKeywords(articleUrl, container) {
-  try {
-    const response = await fetch(articleUrl, { credentials: "include" });
-    if (!response.ok) throw new Error("网络响应不正常");
-
-    const text = await response.text();
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(text, "text/html");
-
-    // 获取关键词元素 - 支持多种文献类型
-    const keywordsSelectors = [
-      // 期刊论文
-      "body > div.wrapper > div.main > div.container > div > div:nth-child(3) > div:nth-child(4) > p.keywords",
-      // 学位论文
-      "body > div.wrapper > div.main > div.container > div > div > div:nth-child(3) > div.brief > div:nth-child(4) > p",
-      // 会议论文
-      "body > div.wrapper > div.main > div.container > div > div.doc-top > div:nth-child(3) > div.brief > div:nth-child(4) > p",
-      // 报纸
-      "body > div.wrapper > div.main > div.container > div.doc > div > div:nth-child(3) > div.brief > div:nth-child(3) > p",
-    ];
-
-    let keywordsElement = null;
-
-    // 尝试所有选择器直到找到匹配的元素
-    for (const selector of keywordsSelectors) {
-      const element = doc.querySelector(selector);
-      if (element && element.classList.contains("keywords")) {
-        keywordsElement = element;
-        break;
+/**
+ * 通过 background.js 下载 PDF
+ */
+function downloadPdf(url, filename) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { action: 'download', url, filename },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          // 回退到新标签页打开
+          window.open(url, '_blank');
+          resolve({ fallback: true });
+          return;
+        }
+        if (response?.error) {
+          // 回退
+          window.open(url, '_blank');
+          resolve({ fallback: true });
+        } else if (response?.skipped) {
+          resolve({ skipped: true });
+        } else {
+          resolve({ downloadId: response.downloadId });
+        }
       }
-    }
-
-    if (keywordsElement) {
-      const keywordLinks = keywordsElement.querySelectorAll("a");
-
-      if (keywordLinks.length > 0) {
-        keywordLinks.forEach((link, index) => {
-          const keyword = link.textContent.replace(/;$/, "").trim();
-          if (keyword) {
-            // 获取关键词链接
-            let keywordUrl = "";
-            try {
-              // 提取href属性并清理
-              const rawHref = link.getAttribute("href");
-              if (rawHref) {
-                // 清理href中的反引号和多余空格
-                keywordUrl = rawHref.replace(/`/g, "").trim();
-              }
-            } catch (e) {
-              console.error("处理关键词链接时出错:", e);
-            }
-
-            // 创建关键词标签为链接
-            const keywordTag = document.createElement("a");
-            keywordTag.className = "keyword-tag";
-            keywordTag.textContent = keyword;
-            keywordTag.href = keywordUrl;
-            keywordTag.target = "_blank"; // 在新标签页打开
-
-            // 降低饱和度和透明度的颜色
-            const colors = [
-              "#f0f8ff,#6eb6ff", // 淡蓝色
-              "#f5fff0,#a3d899", // 淡绿色
-              "#fff8f0,#ffbe7d", // 淡橙色
-              "#fff5fa,#ffa6d2", // 淡粉色
-              "#faf5ff,#c59df9", // 淡紫色
-            ];
-            const [bgColor, textColor] =
-              colors[index % colors.length].split(",");
-
-            Object.assign(keywordTag.style, {
-              display: "inline-block",
-              padding: "0px 4px",
-              margin: "0 4px 2px 0",
-              fontSize: "14px",
-              borderRadius: "4px",
-              backgroundColor: bgColor,
-              color: textColor,
-              border: `1px solid ${textColor}`,
-              whiteSpace: "nowrap",
-              lineHeight: "1.2",
-              opacity: "0.7",
-              textDecoration: "none", // 移除下划线
-              cursor: "pointer",
-            });
-
-            container.appendChild(keywordTag);
-          }
-        });
-      }
-    }
-  } catch (error) {
-    console.error("获取关键词时出错:", error);
-  }
+    );
+  });
 }
-// 修改PDF链接获取函数
+
+/**
+ * 获取文章页面的 PDF/DOI/来源链接
+ */
 async function fetchPdfUrl(articleUrl, row) {
   try {
-    console.log(`开始获取文章页: ${articleUrl}`);
-    const response = await fetch(articleUrl, { credentials: "include" });
-    if (!response.ok)
-      throw new Error(
-        `网络响应不正常: ${response.status} ${response.statusText}`,
-      );
+    const response = await fetch(articleUrl, { credentials: 'include' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
     const text = await response.text();
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(text, "text/html");
-    console.log("文章页HTML解析完成");
+    const doc = new DOMParser().parseFromString(text, 'text/html');
 
-    // 1. 优先查找DOI链接
-    console.log("步骤1: 查找DOI链接...");
-    const doiLink = doc.querySelector(
-      'a[href*="doi.org"], a[href*="dx.doi.org"]',
-    );
+    // 1. DOI 链接
+    const doiLink = doc.querySelector('a[href*="doi.org"], a[href*="dx.doi.org"]');
     if (doiLink?.href) {
       try {
-        const validUrl = new URL(doiLink.href); // 验证并可能标准化URL
-        if (validUrl.protocol === "http:" || validUrl.protocol === "https:") {
-          console.log("找到有效DOI链接:", validUrl.href);
-          return validUrl.href;
-        }
-        console.warn("找到的DOI链接协议无效:", doiLink.href);
-      } catch (e) {
-        console.warn("找到的DOI链接格式无效:", doiLink.href);
-      }
-    } else {
-      console.log("未找到DOI链接.");
+        const url = new URL(doiLink.href);
+        if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
+      } catch {}
     }
 
-    // 2. 查找“全部来源”区域的链接
-    console.log("步骤2: 查找“全部来源”链接...");
-    const allSourceLinks = doc.querySelectorAll(
-      ".detail_doc-database-content__3nYOl .detail_doc-database-link__7ovGD a",
+    // 2. "全部来源"链接
+    const sourceLinks = doc.querySelectorAll(
+      '.detail_doc-database-content__3nYOl .detail_doc-database-link__7ovGD a'
     );
-    console.log(`找到 ${allSourceLinks.length} 个潜在的“全部来源”链接元素.`);
-    if (allSourceLinks.length === 0) {
-      console.log(
-        '选择器 ".detail_doc-database-content__3nYOl .detail_doc-database-link__7ovGD a" 未找到任何元素。',
-      );
-      // 可选：记录部分页面HTML以供调试
-      // console.log('页面部分HTML:', doc.body.innerHTML.substring(0, 5000));
-    }
-    let foundSourceLink = null;
-    for (const sourceLink of allSourceLinks) {
-      console.log("检查潜在来源元素 outerHTML:", sourceLink.outerHTML); // 新增日志
-      if (sourceLink?.href) {
-        const originalHref = sourceLink.href;
-        console.log("检查潜在来源链接 href:", originalHref);
-        try {
-          let cleanedHref = originalHref.trim().replace(/^`|`$/g, "");
-          // 尝试解析URL，处理相对路径
-          const potentialUrl = new URL(cleanedHref, articleUrl);
-          console.log("解析后的潜在来源URL:", potentialUrl.href);
-
-          if (
-            potentialUrl.protocol === "http:" ||
-            potentialUrl.protocol === "https:"
-          ) {
-            console.log("找到有效的“全部来源”链接:", potentialUrl.href);
-            foundSourceLink = potentialUrl.href; // 暂存找到的链接
-            // 可以在这里添加逻辑，优先选择包含特定关键词的链接，如果需要
-            // 例如: if (potentialUrl.href.toLowerCase().includes('pdf')) { return potentialUrl.href; }
-            break; // 找到第一个有效的就跳出循环
-          } else {
-            console.warn("解析后的来源URL协议无效:", potentialUrl.href);
-          }
-        } catch (e) {
-          console.error(
-            "处理“全部来源”链接时发生错误:",
-            originalHref,
-            "错误:",
-            e,
-          );
-        }
-      } else {
-        console.log("跳过无效的 sourceLink 或 href 属性为空:", sourceLink);
-      }
-    }
-    if (foundSourceLink) {
-      console.log("返回找到的“全部来源”链接:", foundSourceLink);
-      return foundSourceLink;
-    } else {
-      console.log("未在“全部来源”区域找到有效链接.");
+    for (const sl of sourceLinks) {
+      if (!sl?.href) continue;
+      try {
+        const url = new URL(sl.href.trim().replace(/^`|`$/g, ''), articleUrl);
+        if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
+      } catch {}
     }
 
-    // 3. 最后查找PDF/CAJ下载按钮
-    console.log("步骤3: 查找PDF/CAJ下载按钮...");
-    // 判断是否是学位论文 (根据URL或页面特征)
-    // 检查 row 是否存在，避免在非列表页调用时出错
-    const isThesis =
-      row?.querySelector('img[src*="thesis"]') || articleUrl.includes("CDMD");
-    console.log(`是否为学位论文: ${isThesis}`);
+    // 3. PDF/CAJ 下载按钮
+    const isThesis = row?.querySelector('img[src*="thesis"]') || articleUrl.includes('CDMD');
 
     if (isThesis) {
-      // 学位论文下载按钮选择器
-      const thesisPdfLink = doc.querySelector(".btn-dlcaj, .btn-dlpdf"); // CAJ优先还是PDF优先？根据实际情况调整
-      if (thesisPdfLink?.href) {
+      const thesisLink = doc.querySelector('.btn-dlcaj, .btn-dlpdf');
+      if (thesisLink?.href) {
         try {
-          const validUrl = new URL(thesisPdfLink.href, articleUrl);
-          if (validUrl.protocol === "http:" || validUrl.protocol === "https:") {
-            console.log("找到学位论文下载链接:", validUrl.href);
-            return validUrl.href;
-          }
-          console.warn("找到的学位论文下载链接协议无效:", thesisPdfLink.href);
-        } catch (e) {
-          console.warn("找到的学位论文下载链接格式无效:", thesisPdfLink.href);
-        }
+          const url = new URL(thesisLink.href, articleUrl);
+          if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
+        } catch {}
       }
     } else {
-      // 期刊论文下载按钮选择器
-      const downloadLinks = doc.querySelectorAll("#pdfDown, #cajDown");
-      let foundPdfLink = null;
-      let foundCajLink = null;
-
-      for (const link of downloadLinks) {
-        if (link?.href) {
-          const linkText = link.textContent?.trim().toLowerCase() || "";
-          try {
-            const validUrl = new URL(link.href, articleUrl);
-            if (
-              validUrl.protocol !== "http:" &&
-              validUrl.protocol !== "https:"
-            ) {
-              console.warn("下载按钮链接协议无效:", link.href);
-              continue;
-            }
-            if (linkText.includes("pdf")) {
-              console.log("找到PDF下载按钮链接:", validUrl.href);
-              foundPdfLink = validUrl.href;
-              break; // 优先PDF，找到就停止
-            } else if (linkText.includes("caj") && !foundCajLink) {
-              console.log("找到CAJ下载按钮链接:", validUrl.href);
-              foundCajLink = validUrl.href; // 暂存CAJ链接
-            }
-          } catch (e) {
-            console.warn("下载按钮链接格式无效:", link.href);
-          }
-        }
+      const downloadBtns = doc.querySelectorAll('#pdfDown, #cajDown');
+      let pdfLink = null, cajLink = null;
+      for (const btn of downloadBtns) {
+        if (!btn?.href) continue;
+        try {
+          const url = new URL(btn.href, articleUrl);
+          if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
+          const text = (btn.textContent || '').trim().toLowerCase();
+          if (text.includes('pdf') && !pdfLink) pdfLink = url.href;
+          else if (text.includes('caj') && !cajLink) cajLink = url.href;
+        } catch {}
       }
-
-      if (foundPdfLink) {
-        return foundPdfLink;
-      }
-      if (foundCajLink) {
-        return foundCajLink;
-      }
+      if (pdfLink) return pdfLink;
+      if (cajLink) return cajLink;
     }
 
-    console.log("所有步骤均未找到有效的下载链接.");
     return null;
   } catch (error) {
-    console.error(`获取PDF链接时出错 (${articleUrl}):`, error);
-    // 避免向上抛出错误导致整个脚本停止，而是返回null
-    // throw error;
-    return null; // 返回null，让调用处处理
+    console.error(`[cnki-Scholar] fetchPdfUrl 失败 (${articleUrl}):`, error);
+    return null;
   }
 }
 
-// 修改摘要悬停功能选择器
+// ========== 关键词 ==========
+
+async function fetchKeywords(articleUrl, container) {
+  try {
+    const response = await fetch(articleUrl, { credentials: 'include' });
+    if (!response.ok) return;
+
+    const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+
+    let keywordsEl = null;
+    for (const sel of SELECTORS.keywords) {
+      const el = doc.querySelector(sel);
+      if (el && el.classList.contains('keywords')) { keywordsEl = el; break; }
+    }
+    if (!keywordsEl) return;
+
+    const links = keywordsEl.querySelectorAll('a');
+    links.forEach((link, i) => {
+      const keyword = link.textContent.replace(/;$/, '').trim();
+      if (!keyword) return;
+
+      const [bg, fg] = KEYWORD_COLORS[i % KEYWORD_COLORS.length];
+      const tag = document.createElement('a');
+      tag.className = 'keyword-tag';
+      tag.textContent = keyword;
+
+      // 清理链接
+      const rawHref = link.getAttribute('href');
+      if (rawHref) tag.href = rawHref.replace(/`/g, '').trim();
+      tag.target = '_blank';
+
+      Object.assign(tag.style, {
+        backgroundColor: bg,
+        color: fg,
+        border: `1px solid ${fg}`,
+      });
+
+      container.appendChild(tag);
+    });
+  } catch (error) {
+    console.error('[cnki-Scholar] 获取关键词出错:', error);
+  }
+}
+
+// ========== 摘要悬停 ==========
+
 async function addHoverForAbstracts() {
-  const articleLinks = document.querySelectorAll(`
-    #gridTable > div > div > div > table > tbody > tr > td.name > a.fz14,
-    #gridTable > div > div > div > table > tbody > tr > td.name > div > a.fz14,
-    .result-table-list tbody tr td.name a
-  `);
+  const articleLinks = getArticleLinks();
 
   for (const link of articleLinks) {
     if (link.dataset.abstractAdded) continue;
     link.dataset.abstractAdded = true;
 
-    // 创建悬停提示框
-    const tooltip = document.createElement("div");
-    tooltip.className = "cnki-abstract-tooltip";
-    Object.assign(tooltip.style, {
-      position: "fixed",
-      maxWidth: "400px",
-      padding: "10px",
-      background: "#fff",
-      border: "1px solid #ddd",
-      borderRadius: "4px",
-      boxShadow: "0 2px 8px rgba(0,0,0,0.1)",
-      zIndex: "9999",
-      display: "none",
-      fontSize: "14px", // 这里将字号从14px改为12px
-      lineHeight: "1.5",
-      color: "#333",
-      maxHeight: "300px", // 限制最大高度
-      overflowY: "auto", // 添加垂直滚动条
-    });
+    const tooltip = document.createElement('div');
+    tooltip.className = 'cnki-abstract-tooltip';
     document.body.appendChild(tooltip);
 
-    // 鼠标悬停事件
-    link.addEventListener("mouseenter", async (e) => {
-      // 先显示提示框以获取其尺寸
-      tooltip.style.display = "block";
-      tooltip.textContent = "加载摘要中...";
-
-      // 计算位置，确保不超出视窗
-      const rect = link.getBoundingClientRect();
-      const viewportWidth = window.innerWidth;
-      const viewportHeight = window.innerHeight;
-
-      // 获取提示框尺寸
-      const tooltipRect = tooltip.getBoundingClientRect();
-
-      // 智能定位：优先右侧，空间不足则左侧
-      let left = rect.right + 10;
-      if (left + tooltipRect.width > viewportWidth - 20) {
-        // 右侧空间不足，尝试左侧
-        left = rect.left - tooltipRect.width - 10;
-        // 如果左侧也不足，则居中显示
-        if (left < 20) {
-          left = Math.max(
-            20,
-            Math.min(
-              viewportWidth - tooltipRect.width - 20,
-              rect.left + (rect.width - tooltipRect.width) / 2,
-            ),
-          );
-        }
-      }
-
-      // 垂直定位：优先与链接顶部对齐，空间不足则调整
-      let top = rect.top;
-      // 如果底部超出视窗，向上调整
-      if (top + tooltipRect.height > viewportHeight - 20) {
-        // 尝试将底部对齐到视窗底部
-        top = viewportHeight - tooltipRect.height - 20;
-        // 确保不超出顶部
-        top = Math.max(20, top);
-      }
-
-      // 应用计算后的位置
-      tooltip.style.left = `${left}px`;
-      tooltip.style.top = `${top}px`;
+    link.addEventListener('mouseenter', async () => {
+      tooltip.style.display = 'block';
+      tooltip.textContent = '加载摘要中...';
+      positionTooltip(tooltip, link);
 
       try {
         const abstract = await fetchAbstract(link.href);
-        tooltip.innerHTML =
-          abstract || '<span style="color:#999">无摘要内容</span>';
-
-        // 摘要加载后再次检查位置（内容可能改变尺寸）
-        const updatedTooltipRect = tooltip.getBoundingClientRect();
-
-        // 重新计算水平位置
-        left = rect.right + 10;
-        if (left + updatedTooltipRect.width > viewportWidth - 20) {
-          left = rect.left - updatedTooltipRect.width - 10;
-          if (left < 20) {
-            left = Math.max(
-              20,
-              Math.min(
-                viewportWidth - updatedTooltipRect.width - 20,
-                rect.left + (rect.width - updatedTooltipRect.width) / 2,
-              ),
-            );
-          }
-        }
-
-        // 重新计算垂直位置
-        top = rect.top;
-        if (top + updatedTooltipRect.height > viewportHeight - 20) {
-          top = viewportHeight - updatedTooltipRect.height - 20;
-          top = Math.max(20, top);
-        }
-
-        // 应用最终位置
-        tooltip.style.left = `${left}px`;
-        tooltip.style.top = `${top}px`;
-      } catch (error) {
-        console.error("获取摘要失败:", error);
+        tooltip.innerHTML = abstract || '<span style="color:#999">无摘要内容</span>';
+        positionTooltip(tooltip, link); // 内容变化后重新定位
+      } catch {
         tooltip.innerHTML = '<span style="color:red">获取摘要失败</span>';
       }
     });
 
-    // 确保鼠标离开时隐藏提示框
-    link.addEventListener("mouseleave", () => {
-      tooltip.style.display = "none";
-    });
+    link.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
 
-    // 添加点击提示框内部时不关闭
-    tooltip.addEventListener("mouseenter", () => {
-      tooltip.dataset.hovering = "true";
-    });
-
-    tooltip.addEventListener("mouseleave", () => {
-      tooltip.dataset.hovering = "false";
-      tooltip.style.display = "none";
-    });
+    tooltip.addEventListener('mouseenter', () => { tooltip.dataset.hovering = 'true'; });
+    tooltip.addEventListener('mouseleave', () => { tooltip.dataset.hovering = 'false'; tooltip.style.display = 'none'; });
   }
 }
 
-// 获取摘要内容
+function positionTooltip(tooltip, anchor) {
+  const rect = anchor.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const tr = tooltip.getBoundingClientRect();
+
+  let left = rect.right + 10;
+  if (left + tr.width > vw - 20) {
+    left = rect.left - tr.width - 10;
+    if (left < 20) left = Math.max(20, (vw - tr.width) / 2);
+  }
+
+  let top = rect.top;
+  if (top + tr.height > vh - 20) top = Math.max(20, vh - tr.height - 20);
+
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${top}px`;
+}
+
 async function fetchAbstract(articleUrl) {
-  try {
-    const response = await fetch(articleUrl, { credentials: "include" });
-    if (!response.ok) throw new Error("网络响应不正常");
-
-    const text = await response.text();
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(text, "text/html");
-
-    // 获取摘要内容
-    const abstractElement = doc.querySelector("#ChDivSummary");
-    return abstractElement ? abstractElement.textContent.trim() : null;
-  } catch (error) {
-    console.error("获取摘要时出错:", error);
-    throw error;
-  }
+  const response = await fetch(articleUrl, { credentials: 'include' });
+  if (!response.ok) throw new Error('网络响应不正常');
+  const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+  const el = doc.querySelector('#ChDivSummary');
+  return el ? el.textContent.trim() : null;
 }
 
-// 添加下载所有按钮
-function addDownloadAllButton() {
-  const pagesDiv = document.querySelector(
-    "#briefBox > div:nth-child(2) > div > div.pages",
-  );
-  if (pagesDiv && !pagesDiv.querySelector(".download-all-btn")) {
-    const downloadAllBtn = document.createElement("button");
-    downloadAllBtn.className = "download-all-btn";
-    downloadAllBtn.textContent = "下载所有PDF";
-    pagesDiv.appendChild(downloadAllBtn);
-
-    downloadAllBtn.addEventListener("click", async () => {
-      try {
-        await downloadAllPdfs();
-      } catch (error) {
-        console.error("下载所有PDF时出错:", error);
-        alert("下载所有PDF时出错: " + error.message);
-      }
-    });
-  }
-}
-
-// 下载队列管理类
-class DownloadQueue {
-  constructor(maxConcurrent = 1) {
-    // 默认并发数改为1
-    this.queue = [];
-    this.running = 0;
-    this.maxConcurrent = maxConcurrent;
-    this.totalTasks = 0;
-    this.completedTasks = 0;
-    this.failedTasks = 0;
-  }
-
-  async add(task) {
-    this.totalTasks++;
-    this.queue.push(task);
-    await this.processQueue();
-  }
-
-  async processQueue() {
-    if (this.running >= this.maxConcurrent || this.queue.length === 0) return;
-
-    const task = this.queue.shift();
-    this.running++;
-
-    try {
-      await this.executeTask(task);
-      this.completedTasks++;
-    } catch (error) {
-      console.error("任务执行失败:", error);
-      this.failedTasks++;
-      if (task.retries < 3) {
-        task.retries++;
-        this.queue.push(task);
-      }
-    } finally {
-      this.running--;
-      this.updateProgress();
-      await this.processQueue();
-    }
-  }
-
-  async executeTask(task) {
-    const delay = Math.random() * 2000 + 8000; // 修改为8-10秒随机延迟
-    await new Promise((resolve) => setTimeout(resolve, delay));
-    await task.execute();
-  }
-
-  updateProgress() {
-    const progressElement = document.querySelector(".download-progress");
-    if (progressElement) {
-      const progress = Math.round(
-        (this.completedTasks / this.totalTasks) * 100,
-      );
-      progressElement.textContent = `下载进度: ${progress}% (${this.completedTasks}/${this.totalTasks})`;
-      if (this.failedTasks > 0) {
-        progressElement.textContent += ` 失败: ${this.failedTasks}`;
-      }
-    }
-  }
-}
-
-// 下载所有页面的PDF
-async function downloadAllPdfs() {
-  const downloadAllBtn = document.querySelector(".download-all-btn");
-  if (!downloadAllBtn) return; // 如果找不到按钮，则退出
-
-  const originalText = downloadAllBtn.textContent;
-  downloadAllBtn.textContent = "下载中...";
-  downloadAllBtn.disabled = true;
-
-  const downloadQueue = new DownloadQueue(); // 使用默认并发数 (已修改为2)
-  const articleLinks = document.querySelectorAll(
-    "#gridTable > div > div > div > table > tbody > tr > td.name > a.fz14, #gridTable > div > div > div > table > tbody > tr > td.name > div > a.fz14",
-  );
-
-  // 创建进度显示元素
-  const progressElement = document.createElement("div");
-  progressElement.className = "download-progress";
-  progressElement.style.cssText =
-    "position: fixed; top: 10px; right: 10px; background: #fff; padding: 10px; border: 1px solid #ddd; border-radius: 4px; z-index: 9999;";
-  document.body.appendChild(progressElement);
-
-  try {
-    // 添加下载任务到队列
-    for (const link of articleLinks) {
-      await downloadQueue.add({
-        retries: 0,
-        execute: async () => {
-          const pdfUrl = await fetchPdfUrl(link.href);
-          if (pdfUrl) {
-            // 检查是否包含验证码页面特征
-            if (pdfUrl.toLowerCase().includes("checkcode")) {
-              throw new Error("检测到验证码，请手动处理");
-            }
-            window.open(pdfUrl, "_blank");
-          } else {
-            throw new Error("无法获取PDF链接");
-          }
-        },
-      });
-    }
-    // 等待所有任务完成
-    await new Promise((resolve) => {
-      const interval = setInterval(() => {
-        if (downloadQueue.running === 0 && downloadQueue.queue.length === 0) {
-          clearInterval(interval);
-          resolve();
-        }
-      }, 100);
-    });
-  } catch (error) {
-    console.error("下载所有PDF过程中出错:", error);
-    alert("下载所有PDF过程中出错: " + error.message);
-  } finally {
-    // 恢复按钮状态
-    downloadAllBtn.textContent = originalText;
-    downloadAllBtn.disabled = false;
-    // 可选：移除进度显示元素
-    // if (progressElement) progressElement.remove();
-  }
-}
-
-// 添加缓存对象
-const journalCache = {
-  data: null,
-  lastFetch: 0,
-  CACHE_DURATION: 3600000, // 1小时缓存
-};
+// ========== 期刊标签 ==========
 
 async function processJournalTags() {
   try {
-    // 使用缓存数据
-    if (
-      !journalCache.data ||
-      Date.now() - journalCache.lastFetch > journalCache.CACHE_DURATION
-    ) {
+    // 加载/缓存期刊数据
+    if (!journalCache.data || Date.now() - journalCache.lastFetch > journalCache.CACHE_DURATION) {
       journalCache.data = await fetchJournalData(
-        "https://gitee.com/kailangge/cnki-journals/raw/main/cnki_journals.json",
+        'https://gitee.com/kailangge/cnki-journals/raw/main/cnki_journals.json'
       );
       journalCache.lastFetch = Date.now();
     }
+
     const journalsData = journalCache.data;
-    if (!journalsData) return;
-
-    const sourceElements = document.querySelectorAll("td.source");
-    if (sourceElements.length) {
-      sourceElements.forEach((element) => {
-        if (element.querySelector(".journal-tag-container")) return;
-        const journalNameElement = element.querySelector("a, span");
-        const journalName = journalNameElement?.textContent.trim();
-        if (journalName) {
-          let journalInfo;
-
-          // 第一级：精确匹配原始名称
-          journalInfo = journalsData.find(
-            (j) => j.title.toLowerCase() === journalName.toLowerCase(),
-          );
-
-          // 第二级：匹配中英文变体
-          if (!journalInfo) {
-            const variantName = `${journalName}(中英文)`;
-            journalInfo = journalsData.find(
-              (j) => j.title.toLowerCase() === variantName.toLowerCase(),
-            );
-          }
-
-          // 第三级：移除括号模糊匹配
-          if (!journalInfo) {
-            const baseName = journalName.replace(/[（）()]/g, "").trim();
-            journalInfo = journalsData.find((j) =>
-              j.title.toLowerCase().includes(baseName.toLowerCase()),
-            );
-          }
-
-          if (!journalInfo) return;
-          const tagContainer = document.createElement("div");
-          tagContainer.className = "journal-tag-container";
-          Object.assign(tagContainer.style, {
-            display: "flex",
-            flexWrap: "wrap",
-            gap: "4px",
-            marginTop: "2px",
-            lineHeight: "1",
-          });
-          // 影响因子标签
-          if (journalInfo.impactFactor && journalInfo.impactFactor !== "N/A") {
-            const impactTag = document.createElement("span");
-            impactTag.className = "journal-tag impact-tag";
-            impactTag.textContent = `IF: ${journalInfo.impactFactor}`;
-            Object.assign(impactTag.style, {
-              display: "inline-block",
-              padding: "2px 6px",
-              backgroundColor: "rgba(156, 39, 176, 0.8)",
-              color: "white",
-              borderRadius: "4px",
-              fontSize: "14px",
-              fontWeight: "500",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-              marginRight: "4px",
-            });
-            tagContainer.appendChild(impactTag);
-          }
-
-          // JCR影响因子标签
-          if (journalInfo.JCR_IF && journalInfo.JCR_IF !== "N/A") {
-            const jcrIfTag = document.createElement("span");
-            jcrIfTag.className = "journal-tag jcr-if-tag";
-            jcrIfTag.textContent = `JCR IF: ${journalInfo.JCR_IF}`;
-            Object.assign(jcrIfTag.style, {
-              display: "inline-block",
-              padding: "2px 6px",
-              backgroundColor: "rgba(156, 39, 176, 0.8)",
-              color: "white",
-              borderRadius: "4px",
-              fontSize: "14px",
-              fontWeight: "500",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-              marginRight: "4px",
-            });
-            tagContainer.appendChild(jcrIfTag);
-          }
-
-          // 排名标签
-          if (journalInfo.CR && journalInfo.CR !== "N/A") {
-            const rankTag = document.createElement("span");
-            rankTag.className = "journal-tag rank-tag";
-            rankTag.textContent = `排名: ${journalInfo.CR}`;
-            Object.assign(rankTag.style, {
-              display: "inline-block",
-              padding: "2px 6px",
-              backgroundColor: "rgba(156, 39, 176, 0.8)",
-              color: "white",
-              borderRadius: "4px",
-              fontSize: "14px",
-              fontWeight: "500",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-              marginRight: "4px",
-            });
-            tagContainer.appendChild(rankTag);
-          }
-
-          // 中科院标签
-          if (journalInfo["中科院"]) {
-            const casTag = document.createElement("span");
-            casTag.className = "journal-tag cas-tag";
-            casTag.textContent = `中科院 ${journalInfo["中科院"]}区`;
-            let casColor = "#2196F3";
-            switch (journalInfo["中科院"]) {
-              case "1":
-                casColor = "#F44336";
-                break;
-              case "2":
-                casColor = "#FF9800";
-                break;
-              case "3":
-                casColor = "#FFC107";
-                break;
-            }
-            Object.assign(casTag.style, {
-              display: "inline-block",
-              padding: "2px 6px",
-              backgroundColor: casColor,
-              opacity: "0.7",
-              color: "white",
-              borderRadius: "4px",
-              fontSize: "14px",
-              fontWeight: "500",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-              marginRight: "4px",
-            });
-            tagContainer.appendChild(casTag);
-          }
-          // TOP标签
-          if (journalInfo.TOP === "T") {
-            const topTag = document.createElement("span");
-            topTag.className = "journal-tag top-tag";
-            topTag.textContent = "Top";
-            Object.assign(topTag.style, {
-              display: "inline-block",
-              padding: "2px 6px",
-              backgroundColor: "rgba(156, 39, 176, 0.8)",
-              color: "white",
-              borderRadius: "4px",
-              fontSize: "14px",
-              fontWeight: "500",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-              marginRight: "4px",
-            });
-            tagContainer.appendChild(topTag);
-          }
-          // JCR分区标签
-          if (journalInfo.IF_Quartile && journalInfo.IF_Quartile !== "N/A") {
-            const jcrTag = document.createElement("span");
-            jcrTag.className = "journal-tag jcr-tag";
-            jcrTag.textContent = `JCR ${journalInfo.IF_Quartile}`;
-            let jcrColor = "#2196F3";
-            switch (journalInfo.IF_Quartile) {
-              case "Q1":
-                jcrColor = "#F44336";
-                break;
-              case "Q2":
-                jcrColor = "#FF9800";
-                break;
-              case "Q3":
-                jcrColor = "#FFC107";
-                break;
-            }
-            Object.assign(jcrTag.style, {
-              display: "inline-block",
-              padding: "2px 6px",
-              backgroundColor: jcrColor,
-              opacity: "0.7",
-              color: "white",
-              borderRadius: "4px",
-              fontSize: "14px",
-              fontWeight: "500",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-              marginRight: "4px",
-            });
-            tagContainer.appendChild(jcrTag);
-          }
-          // WOS标签
-          if (journalInfo.WOS && journalInfo.WOS !== "N/A") {
-            const wosValues = journalInfo.WOS.split(";");
-            wosValues.forEach((wosValue) => {
-              const wosTag = document.createElement("span");
-              wosTag.className = "journal-tag wos-tag";
-              wosTag.textContent = wosValue.trim();
-              Object.assign(wosTag.style, {
-                display: "inline-block",
-                padding: "2px 6px",
-                backgroundColor: "#009688",
-                opacity: "0.7",
-                color: "white",
-                borderRadius: "4px",
-                fontSize: "14px",
-                fontWeight: "500",
-                boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-                marginRight: "4px",
-              });
-              tagContainer.appendChild(wosTag);
-            });
-          }
-          // WJCI标签
-          if (journalInfo.wjci && journalInfo.wjci !== "N/A") {
-            const wjciTag = document.createElement("span");
-            wjciTag.className = "journal-tag wjci-tag";
-            wjciTag.textContent = `WJCI ${journalInfo.wjci}`;
-            const wjciLevel = journalInfo.wjci.substring(0, 2).toUpperCase();
-            let wjciColor = "#5C6BC0";
-            if (wjciLevel === "Q1") wjciColor = "#4CAF50";
-            else if (wjciLevel === "Q2") wjciColor = "#2196F3";
-            else if (wjciLevel === "Q3") wjciColor = "#FFC107";
-            else if (wjciLevel === "Q4") wjciColor = "#F44336";
-            Object.assign(wjciTag.style, {
-              display: "inline-block",
-              padding: "2px 6px",
-              backgroundColor: wjciColor,
-              opacity: "0.7",
-              color: "white",
-              borderRadius: "4px",
-              fontSize: "14px",
-              fontWeight: "500",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-              marginRight: "4px",
-            });
-            tagContainer.appendChild(wjciTag);
-          }
-          // tags原样显示
-          if (journalInfo.tags && journalInfo.tags.length > 0) {
-            journalInfo.tags
-              .sort((a, b) => {
-                if (a.includes("CSSCI")) return -1;
-                if (b.includes("CSSCI")) return 1;
-                return 0;
-              })
-              .forEach((tagText) => {
-                if (tagText && tagText !== "N/A") {
-                  const singleTag = document.createElement("span");
-                  singleTag.className = "journal-tag";
-                  singleTag.textContent = tagText;
-                  let bgColor = "#5C6BC0";
-                  if (tagText.includes("核心")) bgColor = "#F44336";
-                  else if (tagText.includes("扩展")) bgColor = "#FF9800";
-                  else if (tagText.includes("EI")) bgColor = "#FF7043";
-                  else if (tagText.includes("SCI")) bgColor = "#4CAF50";
-                  else if (tagText.includes("CSSCI")) bgColor = "#9C27B0";
-                  Object.assign(singleTag.style, {
-                    display: "inline-block",
-                    padding: "2px 6px",
-                    backgroundColor: bgColor,
-                    color: "white",
-                    borderRadius: "4px",
-                    fontSize: "14px",
-                    fontWeight: "500",
-                    boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-                    marginRight: "4px",
-                    opacity: "0.7",
-                  });
-                  tagContainer.appendChild(singleTag);
-                }
-              });
-          }
-          if (tagContainer.hasChildNodes()) {
-            journalNameElement.insertAdjacentElement("afterend", tagContainer);
-          }
-          if (journalInfo) {
-            const row = element.closest("tr");
-            if (row) {
-              const dataElement = row.querySelector("td.data");
-              if (dataElement) {
-                dataElement
-                  .querySelectorAll(".custom-journal-info")
-                  .forEach((el) => el.remove());
-              }
-            }
-          }
-        }
-      });
+    if (!journalsData) {
+      console.warn('[cnki-Scholar] 期刊数据为空，跳过标签渲染');
+      return;
     }
-    const journalElement = document.querySelector(".top-tip span a");
-    if (journalElement) {
-      const journalName = document
-        .querySelector(".top-tip span a")
-        .textContent.trim()
-        .split(" ")[0];
-      const hostElement = document.querySelector(".wx-tit");
-      const journalTagContainer = document.querySelector(
-        ".journal-tag-container",
-      );
+    console.log(`[cnki-Scholar] 开始处理期刊标签，数据量: ${journalsData.length}`);
 
-      if (journalName && !journalTagContainer) {
-        let journalInfo;
+    // 搜索结果页：遍历来源单元格
+    const sourceElements = document.querySelectorAll(SELECTORS.sourceCells);
+    console.log(`[cnki-Scholar] 找到 ${sourceElements.length} 个期刊元素`);
 
-        // 第一级：精确匹配原始名称
-        journalInfo = journalsData.find(
-          (j) => j.title.toLowerCase() === journalName.toLowerCase(),
-        );
+    sourceElements.forEach(element => {
+      if (element.querySelector('.journal-tag-container')) return;
+      const nameEl = element.querySelector('a, span');
+      const journalName = nameEl?.textContent.trim();
+      if (!journalName) return;
 
-        // 第二级：匹配中英文变体
-        if (!journalInfo) {
-          const variantName = `${journalName}(中英文)`;
-          journalInfo = journalsData.find(
-            (j) => j.title.toLowerCase() === variantName.toLowerCase(),
-          );
-        }
+      const journalInfo = findJournal(journalName, journalsData);
+      if (!journalInfo) return;
 
-        // 第三级：移除括号模糊匹配
-        if (!journalInfo) {
-          const baseName = journalName.replace(/[（）()]/g, "").trim();
-          journalInfo = journalsData.find((j) =>
-            j.title.toLowerCase().includes(baseName.toLowerCase()),
-          );
-        }
+      const tagContainer = document.createElement('div');
+      tagContainer.className = 'journal-tag-container';
+      renderJournalTags(journalInfo, tagContainer);
 
-        if (!journalInfo) return;
-        const tagContainer = document.createElement("div");
-        tagContainer.className = "journal-tag-container";
-        Object.assign(tagContainer.style, {
-          display: "flex",
-          flexWrap: "wrap",
-          gap: "4px",
-          marginTop: "2px",
-          lineHeight: "1",
-        });
-        // 影响因子标签
-        if (journalInfo.impactFactor && journalInfo.impactFactor !== "N/A") {
-          const impactTag = document.createElement("span");
-          impactTag.className = "journal-tag impact-tag";
-          impactTag.textContent = `IF: ${journalInfo.impactFactor}`;
-          Object.assign(impactTag.style, {
-            display: "inline-block",
-            padding: "2px 6px",
-            backgroundColor: "rgba(156, 39, 176, 0.8)",
-            color: "white",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontWeight: "500",
-            boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-            marginRight: "4px",
-          });
-          tagContainer.appendChild(impactTag);
-        }
+      if (tagContainer.hasChildNodes()) {
+        nameEl.insertAdjacentElement('afterend', tagContainer);
+      }
 
-        // JCR影响因子标签
-        if (journalInfo.JCR_IF && journalInfo.JCR_IF !== "N/A") {
-          const jcrIfTag = document.createElement("span");
-          jcrIfTag.className = "journal-tag jcr-if-tag";
-          jcrIfTag.textContent = `JCR IF: ${journalInfo.JCR_IF}`;
-          Object.assign(jcrIfTag.style, {
-            display: "inline-block",
-            padding: "2px 6px",
-            backgroundColor: "rgba(156, 39, 176, 0.8)",
-            color: "white",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontWeight: "500",
-            boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-            marginRight: "4px",
-          });
-          tagContainer.appendChild(jcrIfTag);
-        }
+      // 清除旧的自定义元素（如有）
+      const row = element.closest('tr');
+      const dataEl = row?.querySelector('td.data');
+      if (dataEl) dataEl.querySelectorAll('.custom-journal-info').forEach(el => el.remove());
+    });
 
-        // 排名标签
-        if (journalInfo.CR && journalInfo.CR !== "N/A") {
-          const rankTag = document.createElement("span");
-          rankTag.className = "journal-tag rank-tag";
-          rankTag.textContent = `排名: ${journalInfo.CR}`;
-          Object.assign(rankTag.style, {
-            display: "inline-block",
-            padding: "2px 6px",
-            backgroundColor: "rgba(156, 39, 176, 0.8)",
-            color: "white",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontWeight: "500",
-            boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-            marginRight: "4px",
-          });
-          tagContainer.appendChild(rankTag);
-        }
+    // 详情页：期刊名在 .top-tip 下
+    const detailJournalEl = document.querySelector(SELECTORS.detailJournalName);
+    const hostEl = document.querySelector(SELECTORS.detailHost);
+    if (detailJournalEl && hostEl && !document.querySelector('.journal-tag-container')) {
+      const journalName = detailJournalEl.textContent.trim().split(' ')[0];
+      const journalInfo = findJournal(journalName, journalsData);
 
-        // 中科院标签
-        if (journalInfo["中科院"]) {
-          const casTag = document.createElement("span");
-          casTag.className = "journal-tag cas-tag";
-          casTag.textContent = `中科院 ${journalInfo["中科院"]}区`;
-          let casColor = "#2196F3";
-          switch (journalInfo["中科院"]) {
-            case "1":
-              casColor = "#F44336";
-              break;
-            case "2":
-              casColor = "#FF9800";
-              break;
-            case "3":
-              casColor = "#FFC107";
-              break;
-          }
-          Object.assign(casTag.style, {
-            display: "inline-block",
-            padding: "2px 6px",
-            backgroundColor: casColor,
-            opacity: "0.7",
-            color: "white",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontWeight: "500",
-            boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-            marginRight: "4px",
-          });
-          tagContainer.appendChild(casTag);
-        }
-        // TOP标签
-        if (journalInfo.TOP === "T") {
-          const topTag = document.createElement("span");
-          topTag.className = "journal-tag top-tag";
-          topTag.textContent = "Top";
-          Object.assign(topTag.style, {
-            display: "inline-block",
-            padding: "2px 6px",
-            backgroundColor: "rgba(156, 39, 176, 0.8)",
-            color: "white",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontWeight: "500",
-            boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-            marginRight: "4px",
-          });
-          tagContainer.appendChild(topTag);
-        }
-        // JCR分区标签
-        if (journalInfo.IF_Quartile && journalInfo.IF_Quartile !== "N/A") {
-          const jcrTag = document.createElement("span");
-          jcrTag.className = "journal-tag jcr-tag";
-          jcrTag.textContent = `JCR ${journalInfo.IF_Quartile}`;
-          let jcrColor = "#2196F3";
-          switch (journalInfo.IF_Quartile) {
-            case "Q1":
-              jcrColor = "#F44336";
-              break;
-            case "Q2":
-              jcrColor = "#FF9800";
-              break;
-            case "Q3":
-              jcrColor = "#FFC107";
-              break;
-          }
-          Object.assign(jcrTag.style, {
-            display: "inline-block",
-            padding: "2px 6px",
-            backgroundColor: jcrColor,
-            opacity: "0.7",
-            color: "white",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontWeight: "500",
-            boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-            marginRight: "4px",
-          });
-          tagContainer.appendChild(jcrTag);
-        }
-        // WOS标签
-        if (journalInfo.WOS && journalInfo.WOS !== "N/A") {
-          const wosValues = journalInfo.WOS.split(";");
-          wosValues.forEach((wosValue) => {
-            const wosTag = document.createElement("span");
-            wosTag.className = "journal-tag wos-tag";
-            wosTag.textContent = wosValue.trim();
-            Object.assign(wosTag.style, {
-              display: "inline-block",
-              padding: "2px 6px",
-              backgroundColor: "#009688",
-              opacity: "0.7",
-              color: "white",
-              borderRadius: "4px",
-              fontSize: "14px",
-              fontWeight: "500",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-              marginRight: "4px",
-            });
-            tagContainer.appendChild(wosTag);
-          });
-        }
-        // WJCI标签
-        if (journalInfo.wjci && journalInfo.wjci !== "N/A") {
-          const wjciTag = document.createElement("span");
-          wjciTag.className = "journal-tag wjci-tag";
-          wjciTag.textContent = `WJCI ${journalInfo.wjci}`;
-          const wjciLevel = journalInfo.wjci.substring(0, 2).toUpperCase();
-          let wjciColor = "#5C6BC0";
-          if (wjciLevel === "Q1") wjciColor = "#4CAF50";
-          else if (wjciLevel === "Q2") wjciColor = "#2196F3";
-          else if (wjciLevel === "Q3") wjciColor = "#FFC107";
-          else if (wjciLevel === "Q4") wjciColor = "#F44336";
-          Object.assign(wjciTag.style, {
-            display: "inline-block",
-            padding: "2px 6px",
-            backgroundColor: wjciColor,
-            opacity: "0.7",
-            color: "white",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontWeight: "500",
-            boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-            marginRight: "4px",
-          });
-          tagContainer.appendChild(wjciTag);
-        }
-        // tags原样显示
-        if (journalInfo.tags && journalInfo.tags.length > 0) {
-          journalInfo.tags
-            .sort((a, b) => {
-              if (a.includes("CSSCI")) return -1;
-              if (b.includes("CSSCI")) return 1;
-              return 0;
-            })
-            .forEach((tagText) => {
-              if (tagText && tagText !== "N/A") {
-                const singleTag = document.createElement("span");
-                singleTag.className = "journal-tag";
-                singleTag.textContent = tagText;
-                let bgColor = "#5C6BC0";
-                if (tagText.includes("核心")) bgColor = "#F44336";
-                else if (tagText.includes("扩展")) bgColor = "#FF9800";
-                else if (tagText.includes("EI")) bgColor = "#FF7043";
-                else if (tagText.includes("SCI")) bgColor = "#4CAF50";
-                else if (tagText.includes("CSSCI")) bgColor = "#9C27B0";
-                Object.assign(singleTag.style, {
-                  display: "inline-block",
-                  padding: "2px 6px",
-                  backgroundColor: bgColor,
-                  color: "white",
-                  borderRadius: "4px",
-                  fontSize: "14px",
-                  fontWeight: "500",
-                  boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
-                  marginRight: "4px",
-                  opacity: "0.7",
-                });
-                tagContainer.appendChild(singleTag);
-              }
-            });
-        }
+      if (journalInfo) {
+        const tagContainer = document.createElement('div');
+        tagContainer.className = 'journal-tag-container';
+        renderJournalTags(journalInfo, tagContainer);
+
         if (tagContainer.hasChildNodes()) {
-          hostElement.insertAdjacentElement("afterend", tagContainer);
+          hostEl.insertAdjacentElement('afterend', tagContainer);
         }
       }
     }
   } catch (error) {
-    console.error("处理期刊标签时出错:", error);
+    console.error('[cnki-Scholar] 处理期刊标签时出错:', error);
   }
 }
 
-// 新增获取期刊数据的辅助函数
 async function fetchJournalData(url) {
   try {
     const { data, error } = await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve({ error: '请求超时(30s)' }), 30000);
+
       chrome.runtime.sendMessage({ url, retry: 3 }, (response) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) {
+          return resolve({ error: chrome.runtime.lastError.message });
+        }
         if (!response || response.error) {
-          return resolve({ error: response?.error || "无响应" });
+          return resolve({ error: response?.error || '无响应' });
         }
         resolve(response);
       });
     });
 
     if (error || !data) {
-      console.error(`从${url}获取数据失败:`, error);
-      return null;
+      console.error('[cnki-Scholar] 远程数据获取失败:', error);
+      console.warn('[cnki-Scholar] 回退到本地默认数据');
+      return DEFAULT_JOURNALS_DATA;
     }
 
-    // 验证数据格式
     if (Array.isArray(data) && data.length > 0) {
+      console.log(`[cnki-Scholar] 成功加载 ${data.length} 条期刊数据`);
       return data;
     }
-    throw new Error("无效的数据格式");
+    throw new Error('无效的数据格式');
   } catch (error) {
-    console.error(`获取期刊数据失败(${url}):`, error);
-    return null;
+    console.error('[cnki-Scholar] fetchJournalData 失败:', error);
+    console.warn('[cnki-Scholar] 回退到本地默认数据');
+    return DEFAULT_JOURNALS_DATA;
   }
 }
 
-// 新增默认期刊数据常量
-const DEFAULT_JOURNALS_DATA = [
-  {
-    title: "计算机学报",
-    tags: ["核心", "EI"],
-    impactFactor: "2.456",
-  },
-  {
-    title: "软件学报",
-    tags: ["核心", "EI", "CSCD"],
-    impactFactor: "1.892",
-  },
-  {
-    title: "自动化学报",
-    tags: ["核心", "EI"],
-    impactFactor: "3.125",
-  },
-  // 添加更多常见期刊...
-];
+// ========== 批量下载 ==========
+
+/**
+ * 批量下载管理器
+ * 支持: 复选框选择 / 暂停恢复 / 取消 / 逐条状态 / 验证码检测 / 可调延迟
+ */
+class BatchDownloadManager {
+  constructor() {
+    this.panel = null;
+    this.itemList = null;
+    this.statsEl = null;
+    this.progressFill = null;
+    this.startBtn = null;
+    this.pauseBtn = null;
+    this.cancelBtn = null;
+    this.selectAllCb = null;
+    this.countEl = null;
+    this.delayInput = null;
+
+    this.tasks = [];       // { link, row, title, checkbox, statusEl, status }
+    this.running = false;
+    this.paused = false;
+    this.cancelled = false;
+    this.currentAbort = null; // 用于中断当前正在进行的 fetch
+
+    this._initPanel();
+    this._bindEvents();
+  }
+
+  /** 初始化面板 UI */
+  _initPanel() {
+    this.panel = document.createElement('div');
+    this.panel.className = 'batch-panel hidden';
+    this.panel.innerHTML = `
+      <div class="batch-panel-header">
+        <span>📥 批量下载</span>
+        <button class="batch-panel-close" title="关闭">&times;</button>
+      </div>
+      <div class="batch-panel-controls">
+        <label><input type="checkbox" class="cnki-row-checkbox batch-select-all" checked /> 全选</label>
+        <span class="batch-count">已选 0 篇</span>
+        <button class="batch-btn batch-btn-primary batch-start-btn">开始下载</button>
+        <button class="batch-btn batch-btn-warning batch-pause-btn" style="display:none">暂停</button>
+        <button class="batch-btn batch-btn-danger batch-cancel-btn" style="display:none">取消</button>
+        <div class="batch-delay-control">
+          间隔 <input type="number" class="batch-delay-input" value="8" min="3" max="30" /> 秒
+        </div>
+      </div>
+      <div class="batch-progress-bar"><div class="batch-progress-fill" style="width:0%"></div></div>
+      <div class="batch-panel-stats">
+        <span class="batch-stats-text">等待开始</span>
+        <span class="batch-stats-detail"></span>
+      </div>
+      <div class="batch-item-list"></div>
+    `;
+    document.body.appendChild(this.panel);
+
+    // 缓存元素引用
+    this.selectAllCb  = this.panel.querySelector('.batch-select-all');
+    this.countEl      = this.panel.querySelector('.batch-count');
+    this.startBtn     = this.panel.querySelector('.batch-start-btn');
+    this.pauseBtn     = this.panel.querySelector('.batch-pause-btn');
+    this.cancelBtn    = this.panel.querySelector('.batch-cancel-btn');
+    this.delayInput   = this.panel.querySelector('.batch-delay-input');
+    this.progressFill = this.panel.querySelector('.batch-progress-fill');
+    this.statsEl      = this.panel.querySelector('.batch-stats-text');
+    this.statsDetail  = this.panel.querySelector('.batch-stats-detail');
+    this.itemList     = this.panel.querySelector('.batch-item-list');
+
+    // 关闭按钮
+    this.panel.querySelector('.batch-panel-close').addEventListener('click', () => this.hide());
+  }
+
+  /** 绑定事件 */
+  _bindEvents() {
+    this.selectAllCb.addEventListener('change', () => {
+      const checked = this.selectAllCb.checked;
+      this.tasks.forEach(t => { t.checkbox.checked = checked; });
+      this._updateCount();
+    });
+
+    this.startBtn.addEventListener('click', () => this._startDownload());
+    this.pauseBtn.addEventListener('click', () => this._togglePause());
+    this.cancelBtn.addEventListener('click', () => this._cancel());
+  }
+
+  /** 显示面板并扫描文章列表 */
+  show() {
+    this._scanArticles();
+    this.panel.classList.remove('hidden');
+  }
+
+  hide() {
+    if (this.running) {
+      if (!confirm('下载正在进行中，确定关闭？')) return;
+      this._cancel();
+    }
+    this.panel.classList.add('hidden');
+    this._removeCheckboxes();
+  }
+
+  /** 扫描当前页面文章，为每行添加复选框 */
+  _scanArticles() {
+    this.tasks = [];
+    this.itemList.innerHTML = '';
+
+    const links = getArticleLinks();
+    links.forEach(link => {
+      const row = link.closest('tr');
+      if (!row) return;
+
+      // 添加行首复选框（如果还没有）
+      let cb = row.querySelector('.cnki-row-checkbox');
+      if (!cb) {
+        cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'cnki-row-checkbox';
+        cb.checked = true;
+        const firstTd = row.querySelector('td');
+        if (firstTd) {
+          firstTd.insertBefore(cb, firstTd.firstChild);
+        }
+      }
+
+      const title = link.textContent.trim().substring(0, 50);
+      const task = {
+        link,
+        row,
+        title,
+        checkbox: cb,
+        status: 'pending',   // pending | downloading | success | failed | captcha
+        statusEl: null,
+      };
+
+      cb.addEventListener('change', () => this._updateCount());
+
+      // 面板列表项
+      const itemEl = document.createElement('div');
+      itemEl.className = 'batch-item';
+      itemEl.innerHTML = `
+        <span class="batch-item-icon">⬜</span>
+        <span class="batch-item-title" title="${title}">${title}</span>
+        <span class="batch-item-status pending">待下载</span>
+      `;
+      task.statusEl = itemEl.querySelector('.batch-item-status');
+      task.itemEl = itemEl;
+      task.iconEl = itemEl.querySelector('.batch-item-icon');
+
+      this.itemList.appendChild(itemEl);
+      this.tasks.push(task);
+    });
+
+    this._updateCount();
+  }
+
+  /** 移除所有复选框 */
+  _removeCheckboxes() {
+    document.querySelectorAll('.cnki-row-checkbox').forEach(cb => {
+      if (!cb.classList.contains('batch-select-all')) cb.remove();
+    });
+  }
+
+  /** 更新选中计数 */
+  _updateCount() {
+    const selected = this.tasks.filter(t => t.checkbox.checked).length;
+    this.countEl.textContent = `已选 ${selected}/${this.tasks.length} 篇`;
+    this.startBtn.disabled = selected === 0;
+  }
+
+  /** 获取选中的任务 */
+  _getSelected() {
+    return this.tasks.filter(t => t.checkbox.checked && t.status === 'pending');
+  }
+
+  /** 更新单个任务状态 */
+  _setTaskStatus(task, status, detail) {
+    task.status = status;
+    const icons = { pending: '⬜', downloading: '⏳', success: '✅', failed: '❌', captcha: '🚫' };
+    const labels = { pending: '待下载', downloading: '下载中', success: '成功', failed: '失败', captcha: '验证码' };
+    task.iconEl.textContent = icons[status] || '⬜';
+    task.statusEl.textContent = detail || labels[status];
+    task.statusEl.className = `batch-item-status ${status}`;
+    this._updateProgress();
+  }
+
+  /** 更新进度条和统计 */
+  _updateProgress() {
+    const total = this.tasks.filter(t => t.checkbox.checked).length;
+    if (total === 0) return;
+
+    const done = this.tasks.filter(t => t.checkbox.checked && ['success','failed','captcha'].includes(t.status)).length;
+    const success = this.tasks.filter(t => t.status === 'success').length;
+    const failed = this.tasks.filter(t => t.status === 'failed').length;
+    const captcha = this.tasks.filter(t => t.status === 'captcha').length;
+
+    const pct = Math.round((done / total) * 100);
+    this.progressFill.style.width = `${pct}%`;
+    this.progressFill.className = 'batch-progress-fill' +
+      (this.paused ? ' paused' : '') +
+      (failed > success && done > 0 ? ' error' : '');
+
+    this.statsEl.textContent = this.paused ? '⏸ 已暂停' : (this.cancelled ? '⏹ 已取消' : `${pct}% 完成`);
+    let detail = `✅${success}`;
+    if (failed > 0) detail += ` ❌${failed}`;
+    if (captcha > 0) detail += ` 🚫${captcha}`;
+    this.statsDetail.textContent = detail;
+  }
+
+  /** 开始下载 */
+  async _startDownload() {
+    const selected = this._getSelected();
+    if (selected.length === 0) return;
+
+    this.running = true;
+    this.paused = false;
+    this.cancelled = false;
+    this.currentAbort = null;
+
+    // UI 状态切换
+    this.startBtn.style.display = 'none';
+    this.pauseBtn.style.display = '';
+    this.cancelBtn.style.display = '';
+    this.selectAllCb.disabled = true;
+    this.delayInput.disabled = true;
+    this.tasks.forEach(t => { t.checkbox.disabled = true; });
+
+    const baseDelay = parseInt(this.delayInput.value) || 8;
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const task of selected) {
+      if (this.cancelled) break;
+
+      // 等待暂停恢复
+      while (this.paused && !this.cancelled) {
+        await new Promise(r => setTimeout(r, 500));
+      }
+      if (this.cancelled) break;
+
+      this._setTaskStatus(task, 'downloading');
+
+      // 滚动到当前项可见
+      task.itemEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+      try {
+        const pdfUrl = await fetchPdfUrl(task.link.href, task.row);
+
+        if (this.cancelled) break;
+
+        if (pdfUrl) {
+          // 验证码检测
+          if (pdfUrl.toLowerCase().includes('checkcode')) {
+            this._setTaskStatus(task, 'captcha', '需手动验证');
+            this.paused = true;
+            this.pauseBtn.textContent = '继续';
+            this._updateProgress();
+            alert('⚠️ 检测到验证码页面，请手动完成验证后点击"继续"');
+            // 等待用户恢复
+            while (this.paused && !this.cancelled) {
+              await new Promise(r => setTimeout(r, 500));
+            }
+            if (this.cancelled) break;
+            // 重试当前项
+            continue;
+          }
+
+          const result = await downloadPdf(pdfUrl);
+          if (result?.skipped) {
+            this._setTaskStatus(task, 'success', '已存在');
+          } else {
+            this._setTaskStatus(task, 'success');
+          }
+          successCount++;
+        } else {
+          this._setTaskStatus(task, 'failed', '无下载链接');
+          failCount++;
+        }
+      } catch (error) {
+        if (this.cancelled) break;
+        this._setTaskStatus(task, 'failed', error.message.substring(0, 20));
+        failCount++;
+      }
+
+      // 连续失败 3 次，自动暂停提示
+      if (failCount >= 3 && successCount === 0) {
+        this.paused = true;
+        this.pauseBtn.textContent = '继续';
+        this._updateProgress();
+        alert('⚠️ 连续失败，可能触发了反爬限制。请稍后点击"继续"重试。');
+        failCount = 0; // 重置计数
+        while (this.paused && !this.cancelled) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+        if (this.cancelled) break;
+      }
+
+      // 请求间隔（随机浮动 ±30%）
+      if (!this.cancelled) {
+        const delay = baseDelay * 1000 * (0.7 + Math.random() * 0.6);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+
+    // 下载完成
+    this.running = false;
+    this.startBtn.style.display = '';
+    this.pauseBtn.style.display = 'none';
+    this.cancelBtn.style.display = 'none';
+    this.selectAllCb.disabled = false;
+    this.delayInput.disabled = false;
+    this.tasks.forEach(t => { t.checkbox.disabled = false; });
+
+    if (!this.cancelled) {
+      this.startBtn.textContent = '重新下载';
+      this.statsEl.textContent = '✅ 全部完成';
+    }
+  }
+
+  /** 暂停/继续 */
+  _togglePause() {
+    this.paused = !this.paused;
+    this.pauseBtn.textContent = this.paused ? '继续' : '暂停';
+    this._updateProgress();
+  }
+
+  /** 取消 */
+  _cancel() {
+    this.cancelled = true;
+    this.paused = false;
+    this.running = false;
+
+    this.startBtn.style.display = '';
+    this.pauseBtn.style.display = 'none';
+    this.cancelBtn.style.display = 'none';
+    this.selectAllCb.disabled = false;
+    this.delayInput.disabled = false;
+    this.tasks.forEach(t => {
+      t.checkbox.disabled = false;
+      if (t.status === 'downloading') this._setTaskStatus(t, 'failed', '已取消');
+    });
+    this.startBtn.textContent = '重新下载';
+    this._updateProgress();
+  }
+}
+
+// 批量下载管理器实例（懒初始化）
+let batchManager = null;
+
+function addDownloadAllButton() {
+  const pagesDiv = document.querySelector(SELECTORS.pagesDiv);
+  if (!pagesDiv || pagesDiv.querySelector('.download-all-btn')) return;
+
+  const btn = document.createElement('button');
+  btn.className = 'download-all-btn';
+  btn.textContent = '📥 批量下载';
+  pagesDiv.appendChild(btn);
+
+  btn.addEventListener('click', () => {
+    if (!batchManager) batchManager = new BatchDownloadManager();
+    batchManager.show();
+  });
+}
+
+// ========== 初始化 ==========
+
+document.addEventListener('DOMContentLoaded', () => {
+  if (!window.location.hostname.includes('cnki.net')) return;
+
+  // 表格左对齐
+  const style = document.createElement('style');
+  style.textContent = `
+    #gridTable table, #gridTable th, #gridTable td,
+    .result-table-list table, .result-table-list th, .result-table-list td {
+      text-align: left !important;
+    }
+  `;
+  document.head.appendChild(style);
+
+  addPdfDownloadButtons();
+  addHoverForAbstracts();
+  addDownloadAllButton();
+});
+
+// 监听动态加载（防抖）
+let processing = false;
+const observer = new MutationObserver(mutations => {
+  if (processing) return;
+  processing = true;
+  setTimeout(() => {
+    if (mutations.some(m => m.addedNodes.length > 0)) {
+      addPdfDownloadButtons();
+      addHoverForAbstracts();
+      addDownloadAllButton();
+      setTimeout(processJournalTags, 1000 + Math.random() * 2000);
+    }
+    processing = false;
+  }, 500);
+});
+
+observer.observe(document.body, { childList: true, subtree: true });
+
+// 监听来自 background.js 的下载状态通知
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.action === 'downloadStateChanged') {
+    console.log(`[cnki-Scholar] 下载 ${msg.downloadId} 状态: ${msg.state}`);
+  }
+});
