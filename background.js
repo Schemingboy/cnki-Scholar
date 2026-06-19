@@ -4,7 +4,24 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 // 下载历史记录，避免重复下载
+const DOWNLOAD_HISTORY_KEY = 'cnkiScholarDownloadHistory';
 const downloadHistory = new Set();
+
+const historyReady = new Promise(resolve => chrome.storage.local.get({ [DOWNLOAD_HISTORY_KEY]: [] }, (result) => {
+  const history = result[DOWNLOAD_HISTORY_KEY] || [];
+  history.forEach(item => downloadHistory.add(item));
+  resolve();
+}));
+
+function saveDownloadHistory() {
+  chrome.storage.local.set({
+    [DOWNLOAD_HISTORY_KEY]: Array.from(downloadHistory).slice(-5000)
+  });
+}
+
+function buildHistoryKeys({ url, filename, articleKey }) {
+  return [articleKey, filename, url].filter(Boolean);
+}
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // 处理跨域数据请求（Gitee期刊数据）
@@ -48,36 +65,42 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // 处理文件下载请求
   if (request.action === 'download') {
-    const { url, filename } = request;
+    historyReady.then(() => {
+      const { url, filename, articleKey } = request;
+      const historyKeys = buildHistoryKeys({ url, filename, articleKey });
 
-    // 去重检查
-    if (downloadHistory.has(url)) {
-      sendResponse({ skipped: true, reason: '已下载' });
-      return true;
-    }
-
-    chrome.downloads.download({
-      url: url,
-      filename: filename || undefined,
-      conflictAction: 'uniquify',
-      saveAs: false
-    }, (downloadId) => {
-      if (chrome.runtime.lastError) {
-        console.error('[cnki-Scholar] 下载失败:', chrome.runtime.lastError.message);
-        sendResponse({ error: chrome.runtime.lastError.message });
-      } else {
-        downloadHistory.add(url);
-        console.log('[cnki-Scholar] 下载已启动, ID:', downloadId);
-        sendResponse({ downloadId });
+      // 去重检查
+      if (historyKeys.some(key => downloadHistory.has(key))) {
+        sendResponse({ skipped: true, reason: '已下载' });
+        return;
       }
+
+      chrome.downloads.download({
+        url: url,
+        filename: filename || undefined,
+        conflictAction: 'uniquify',
+        saveAs: false
+      }, (downloadId) => {
+        if (chrome.runtime.lastError) {
+          console.error('[cnki-Scholar] 下载失败:', chrome.runtime.lastError.message);
+          sendResponse({ error: chrome.runtime.lastError.message });
+        } else {
+          historyKeys.forEach(key => downloadHistory.add(key));
+          saveDownloadHistory();
+          console.log('[cnki-Scholar] 下载已启动, ID:', downloadId);
+          sendResponse({ downloadId });
+        }
+      });
     });
     return true;
   }
 
   // 清除下载历史
   if (request.action === 'clearDownloadHistory') {
-    downloadHistory.clear();
-    sendResponse({ ok: true });
+    historyReady.then(() => {
+      downloadHistory.clear();
+      chrome.storage.local.remove(DOWNLOAD_HISTORY_KEY, () => sendResponse({ ok: true }));
+    });
     return true;
   }
 });

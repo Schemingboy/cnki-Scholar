@@ -75,6 +75,107 @@ const journalCache = {
 
 // ========== 工具函数 ==========
 
+const DEFAULT_DOWNLOAD_SUBDIR = 'CNKI';
+const SETTINGS_STORAGE_KEY = 'cnkiScholarSettings';
+const CAPTCHA_REQUIRED = '__CNKI_CAPTCHA_REQUIRED__';
+
+function normalizeText(text) {
+  return (text || '').replace(/\s+/g, ' ').trim();
+}
+
+function sanitizeFilename(text) {
+  const name = normalizeText(text)
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\.+$/g, '')
+    .slice(0, 120)
+    .trim();
+  return name || 'cnki-paper';
+}
+
+function normalizeDownloadSubdir(input) {
+  let value = normalizeText(input).replace(/\\/g, '/');
+
+  // If the user pastes H:/CNKI, keep the usable relative part.
+  value = value.replace(/^[a-zA-Z]:\//, '');
+  value = value.replace(/^\/+|\/+$/g, '');
+
+  const parts = value
+    .split('/')
+    .map(part => sanitizeFilename(part))
+    .filter(part => part && part !== '.' && part !== '..');
+
+  return parts.join('/') || DEFAULT_DOWNLOAD_SUBDIR;
+}
+
+function getStoredSettings() {
+  return new Promise(resolve => {
+    chrome.storage.local.get(
+      { [SETTINGS_STORAGE_KEY]: { downloadSubdir: DEFAULT_DOWNLOAD_SUBDIR } },
+      result => {
+        const settings = result?.[SETTINGS_STORAGE_KEY] || {};
+        resolve({
+          downloadSubdir: normalizeDownloadSubdir(settings.downloadSubdir),
+        });
+      }
+    );
+  });
+}
+
+function saveDownloadSubdir(input) {
+  const downloadSubdir = normalizeDownloadSubdir(input);
+  return new Promise(resolve => {
+    chrome.storage.local.set(
+      { [SETTINGS_STORAGE_KEY]: { downloadSubdir } },
+      () => resolve(downloadSubdir)
+    );
+  });
+}
+
+function getDownloadExtension(url) {
+  const lower = (url || '').toLowerCase();
+  if (lower.includes('caj')) return '.caj';
+  if (lower.includes('pdf')) return '.pdf';
+  return '.pdf';
+}
+
+function buildDownloadFilename(title, url, subdir = DEFAULT_DOWNLOAD_SUBDIR) {
+  return `${normalizeDownloadSubdir(subdir)}/${sanitizeFilename(title)}${getDownloadExtension(url)}`;
+}
+
+function buildArticleKey(articleUrl, title) {
+  try {
+    const url = new URL(articleUrl, window.location.href);
+    url.hash = '';
+    return `${url.origin}${url.pathname}${url.search}|${sanitizeFilename(title).toLowerCase()}`;
+  } catch {
+    return `${normalizeText(articleUrl)}|${sanitizeFilename(title).toLowerCase()}`;
+  }
+}
+
+function isVerificationPage(response, text) {
+  const url = (response?.url || '').toLowerCase();
+  const head = (text || '').slice(0, 4000);
+  return (
+    url.includes('checkcode') ||
+    url.includes('verify') ||
+    /验证码|安全验证|访问验证|人机验证|拖动滑块|滑块验证/.test(head)
+  );
+}
+
+function isVerificationUrl(url) {
+  const lower = (url || '').toLowerCase();
+  return lower.includes('checkcode') || lower.includes('captcha') || lower.includes('verify');
+}
+
+function escapeHtml(text) {
+  return normalizeText(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 /**
  * 三级期刊名匹配：精确 → 中英文变体 → 去括号模糊
  */
@@ -266,8 +367,15 @@ async function addPdfDownloadButtons() {
       try {
         const pdfUrl = await fetchPdfUrl(link.href, row);
         if (pdfUrl) {
+          const settings = await getStoredSettings();
+          const title = titleLink?.textContent;
+          const filename = buildDownloadFilename(title, pdfUrl, settings.downloadSubdir);
+
           // 使用 chrome.downloads API（通过 background.js）
-          downloadPdf(pdfUrl);
+          const result = await downloadPdf(pdfUrl, filename, buildArticleKey(link.href, title));
+          if (result?.skipped) {
+            alert(`已下载过这篇文章：\n${filename}`);
+          }
         } else {
           alert('无法获取PDF下载链接');
         }
@@ -285,10 +393,10 @@ async function addPdfDownloadButtons() {
 /**
  * 通过 background.js 下载 PDF
  */
-function downloadPdf(url, filename) {
+function downloadPdf(url, filename, articleKey) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
-      { action: 'download', url, filename },
+      { action: 'download', url, filename, articleKey },
       (response) => {
         if (chrome.runtime.lastError) {
           // 回退到新标签页打开
@@ -319,6 +427,10 @@ async function fetchPdfUrl(articleUrl, row) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
     const text = await response.text();
+    if (isVerificationPage(response, text)) {
+      throw new Error(CAPTCHA_REQUIRED);
+    }
+
     const doc = new DOMParser().parseFromString(text, 'text/html');
 
     // 1. DOI 链接
@@ -350,8 +462,11 @@ async function fetchPdfUrl(articleUrl, row) {
       if (thesisLink?.href) {
         try {
           const url = new URL(thesisLink.href, articleUrl);
+          if (isVerificationUrl(url.href)) throw new Error(CAPTCHA_REQUIRED);
           if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
-        } catch {}
+        } catch (error) {
+          if (error?.message === CAPTCHA_REQUIRED) throw error;
+        }
       }
     } else {
       const downloadBtns = doc.querySelectorAll('#pdfDown, #cajDown');
@@ -360,11 +475,14 @@ async function fetchPdfUrl(articleUrl, row) {
         if (!btn?.href) continue;
         try {
           const url = new URL(btn.href, articleUrl);
+          if (isVerificationUrl(url.href)) throw new Error(CAPTCHA_REQUIRED);
           if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
           const text = (btn.textContent || '').trim().toLowerCase();
           if (text.includes('pdf') && !pdfLink) pdfLink = url.href;
           else if (text.includes('caj') && !cajLink) cajLink = url.href;
-        } catch {}
+        } catch (error) {
+          if (error?.message === CAPTCHA_REQUIRED) throw error;
+        }
       }
       if (pdfLink) return pdfLink;
       if (cajLink) return cajLink;
@@ -372,6 +490,7 @@ async function fetchPdfUrl(articleUrl, row) {
 
     return null;
   } catch (error) {
+    if (error?.message === CAPTCHA_REQUIRED) throw error;
     console.error(`[cnki-Scholar] fetchPdfUrl 失败 (${articleUrl}):`, error);
     return null;
   }
@@ -599,9 +718,12 @@ class BatchDownloadManager {
     this.startBtn = null;
     this.pauseBtn = null;
     this.cancelBtn = null;
+    this.clearHistoryBtn = null;
     this.selectAllCb = null;
     this.countEl = null;
     this.delayInput = null;
+    this.subdirInput = null;
+    this.saveHintEl = null;
 
     this.tasks = [];       // { link, row, title, checkbox, statusEl, status }
     this.running = false;
@@ -631,7 +753,13 @@ class BatchDownloadManager {
         <div class="batch-delay-control">
           间隔 <input type="number" class="batch-delay-input" value="8" min="3" max="30" /> 秒
         </div>
+        <div class="batch-save-control">
+          <span>保存到 下载目录/</span>
+          <input class="batch-save-input" value="${DEFAULT_DOWNLOAD_SUBDIR}" title="只能填写下载目录下的子文件夹，例如 CNKI 或 CNKI/英语论文" />
+          <button class="batch-btn batch-btn-secondary batch-clear-history-btn" title="清空扩展记住的已下载记录">清记录</button>
+        </div>
       </div>
+      <div class="batch-save-hint">当前保存目录：下载目录/${DEFAULT_DOWNLOAD_SUBDIR}</div>
       <div class="batch-progress-bar"><div class="batch-progress-fill" style="width:0%"></div></div>
       <div class="batch-panel-stats">
         <span class="batch-stats-text">等待开始</span>
@@ -647,7 +775,10 @@ class BatchDownloadManager {
     this.startBtn     = this.panel.querySelector('.batch-start-btn');
     this.pauseBtn     = this.panel.querySelector('.batch-pause-btn');
     this.cancelBtn    = this.panel.querySelector('.batch-cancel-btn');
+    this.clearHistoryBtn = this.panel.querySelector('.batch-clear-history-btn');
     this.delayInput   = this.panel.querySelector('.batch-delay-input');
+    this.subdirInput  = this.panel.querySelector('.batch-save-input');
+    this.saveHintEl   = this.panel.querySelector('.batch-save-hint');
     this.progressFill = this.panel.querySelector('.batch-progress-fill');
     this.statsEl      = this.panel.querySelector('.batch-stats-text');
     this.statsDetail  = this.panel.querySelector('.batch-stats-detail');
@@ -668,12 +799,45 @@ class BatchDownloadManager {
     this.startBtn.addEventListener('click', () => this._startDownload());
     this.pauseBtn.addEventListener('click', () => this._togglePause());
     this.cancelBtn.addEventListener('click', () => this._cancel());
+    this.clearHistoryBtn.addEventListener('click', () => this._clearDownloadHistory());
+    this.subdirInput.addEventListener('change', () => this._saveSubdirInput());
+    this.subdirInput.addEventListener('blur', () => this._saveSubdirInput());
   }
 
   /** 显示面板并扫描文章列表 */
   show() {
     this._scanArticles();
+    this._loadSettings();
     this.panel.classList.remove('hidden');
+  }
+
+  async _loadSettings() {
+    const settings = await getStoredSettings();
+    this.subdirInput.value = settings.downloadSubdir;
+    this._updateSaveHint(settings.downloadSubdir);
+  }
+
+  async _saveSubdirInput() {
+    const downloadSubdir = await saveDownloadSubdir(this.subdirInput.value);
+    this.subdirInput.value = downloadSubdir;
+    this._updateSaveHint(downloadSubdir);
+    return downloadSubdir;
+  }
+
+  _updateSaveHint(downloadSubdir) {
+    this.saveHintEl.textContent = `当前保存目录：下载目录/${downloadSubdir}`;
+  }
+
+  _clearDownloadHistory() {
+    if (!confirm('清空已下载记录后，扩展会允许重新下载同一篇文章。确定清空？')) return;
+
+    chrome.runtime.sendMessage({ action: 'clearDownloadHistory' }, (response) => {
+      if (chrome.runtime.lastError || response?.error) {
+        alert('清空失败，请重新加载扩展后再试。');
+        return;
+      }
+      alert('已清空扩展记住的下载记录。');
+    });
   }
 
   hide() {
@@ -708,13 +872,15 @@ class BatchDownloadManager {
         }
       }
 
-      const title = link.textContent.trim().substring(0, 50);
+      const fullTitle = normalizeText(link.textContent);
+      const title = fullTitle.substring(0, 50);
       const task = {
         link,
         row,
-        title,
+        title: fullTitle || title,
+        displayTitle: title,
         checkbox: cb,
-        status: 'pending',   // pending | downloading | success | failed | captcha
+        status: 'pending',   // pending | downloading | success | skipped | failed | captcha
         statusEl: null,
       };
 
@@ -725,7 +891,7 @@ class BatchDownloadManager {
       itemEl.className = 'batch-item';
       itemEl.innerHTML = `
         <span class="batch-item-icon">⬜</span>
-        <span class="batch-item-title" title="${title}">${title}</span>
+        <span class="batch-item-title" title="${escapeHtml(task.title)}">${escapeHtml(task.displayTitle)}</span>
         <span class="batch-item-status pending">待下载</span>
       `;
       task.statusEl = itemEl.querySelector('.batch-item-status');
@@ -761,8 +927,8 @@ class BatchDownloadManager {
   /** 更新单个任务状态 */
   _setTaskStatus(task, status, detail) {
     task.status = status;
-    const icons = { pending: '⬜', downloading: '⏳', success: '✅', failed: '❌', captcha: '🚫' };
-    const labels = { pending: '待下载', downloading: '下载中', success: '成功', failed: '失败', captcha: '验证码' };
+    const icons = { pending: '⬜', downloading: '⏳', success: '✅', skipped: '↩', failed: '❌', captcha: '🚫' };
+    const labels = { pending: '待下载', downloading: '下载中', success: '成功', skipped: '已跳过', failed: '失败', captcha: '需验证' };
     task.iconEl.textContent = icons[status] || '⬜';
     task.statusEl.textContent = detail || labels[status];
     task.statusEl.className = `batch-item-status ${status}`;
@@ -774,8 +940,9 @@ class BatchDownloadManager {
     const total = this.tasks.filter(t => t.checkbox.checked).length;
     if (total === 0) return;
 
-    const done = this.tasks.filter(t => t.checkbox.checked && ['success','failed','captcha'].includes(t.status)).length;
+    const done = this.tasks.filter(t => t.checkbox.checked && ['success','skipped','failed','captcha'].includes(t.status)).length;
     const success = this.tasks.filter(t => t.status === 'success').length;
+    const skipped = this.tasks.filter(t => t.status === 'skipped').length;
     const failed = this.tasks.filter(t => t.status === 'failed').length;
     const captcha = this.tasks.filter(t => t.status === 'captcha').length;
 
@@ -787,6 +954,7 @@ class BatchDownloadManager {
 
     this.statsEl.textContent = this.paused ? '⏸ 已暂停' : (this.cancelled ? '⏹ 已取消' : `${pct}% 完成`);
     let detail = `✅${success}`;
+    if (skipped > 0) detail += ` ↩${skipped}`;
     if (failed > 0) detail += ` ❌${failed}`;
     if (captcha > 0) detail += ` 🚫${captcha}`;
     this.statsDetail.textContent = detail;
@@ -808,13 +976,17 @@ class BatchDownloadManager {
     this.cancelBtn.style.display = '';
     this.selectAllCb.disabled = true;
     this.delayInput.disabled = true;
+    this.subdirInput.disabled = true;
+    this.clearHistoryBtn.disabled = true;
     this.tasks.forEach(t => { t.checkbox.disabled = true; });
 
     const baseDelay = parseInt(this.delayInput.value) || 8;
+    const downloadSubdir = await this._saveSubdirInput();
     let successCount = 0;
     let failCount = 0;
 
-    for (const task of selected) {
+    for (let index = 0; index < selected.length; index++) {
+      const task = selected[index];
       if (this.cancelled) break;
 
       // 等待暂停恢复
@@ -834,25 +1006,11 @@ class BatchDownloadManager {
         if (this.cancelled) break;
 
         if (pdfUrl) {
-          // 验证码检测
-          if (pdfUrl.toLowerCase().includes('checkcode')) {
-            this._setTaskStatus(task, 'captcha', '需手动验证');
-            this.paused = true;
-            this.pauseBtn.textContent = '继续';
-            this._updateProgress();
-            alert('⚠️ 检测到验证码页面，请手动完成验证后点击"继续"');
-            // 等待用户恢复
-            while (this.paused && !this.cancelled) {
-              await new Promise(r => setTimeout(r, 500));
-            }
-            if (this.cancelled) break;
-            // 重试当前项
-            continue;
-          }
+          const filename = buildDownloadFilename(task.title, pdfUrl, downloadSubdir);
+          const result = await downloadPdf(pdfUrl, filename, buildArticleKey(task.link.href, task.title));
 
-          const result = await downloadPdf(pdfUrl);
           if (result?.skipped) {
-            this._setTaskStatus(task, 'success', '已存在');
+            this._setTaskStatus(task, 'skipped', '已下载过');
           } else {
             this._setTaskStatus(task, 'success');
           }
@@ -863,8 +1021,25 @@ class BatchDownloadManager {
         }
       } catch (error) {
         if (this.cancelled) break;
-        this._setTaskStatus(task, 'failed', error.message.substring(0, 20));
-        failCount++;
+        if (error?.message === CAPTCHA_REQUIRED) {
+          this._setTaskStatus(task, 'captcha', '完成验证后继续');
+          this.paused = true;
+          this.pauseBtn.textContent = '继续';
+          this._updateProgress();
+          alert('检测到知网验证。请在页面里手动完成验证，完成后回到这个面板点“继续”，扩展会重试当前这篇。');
+
+          while (this.paused && !this.cancelled) {
+            await new Promise(r => setTimeout(r, 500));
+          }
+
+          if (this.cancelled) break;
+          this._setTaskStatus(task, 'pending', '待重试');
+          index -= 1;
+          continue;
+        } else {
+          this._setTaskStatus(task, 'failed', error.message.substring(0, 20));
+          failCount++;
+        }
       }
 
       // 连续失败 3 次，自动暂停提示
@@ -872,7 +1047,7 @@ class BatchDownloadManager {
         this.paused = true;
         this.pauseBtn.textContent = '继续';
         this._updateProgress();
-        alert('⚠️ 连续失败，可能触发了反爬限制。请稍后点击"继续"重试。');
+        alert('连续失败，可能触发了访问限制或页面结构变化。建议稍等一会儿，确认页面能正常打开后再点“继续”。');
         failCount = 0; // 重置计数
         while (this.paused && !this.cancelled) {
           await new Promise(r => setTimeout(r, 500));
@@ -894,11 +1069,13 @@ class BatchDownloadManager {
     this.cancelBtn.style.display = 'none';
     this.selectAllCb.disabled = false;
     this.delayInput.disabled = false;
+    this.subdirInput.disabled = false;
+    this.clearHistoryBtn.disabled = false;
     this.tasks.forEach(t => { t.checkbox.disabled = false; });
 
     if (!this.cancelled) {
-      this.startBtn.textContent = '重新下载';
-      this.statsEl.textContent = '✅ 全部完成';
+      this.startBtn.textContent = '继续未完成';
+      this.statsEl.textContent = '✅ 已处理完成';
     }
   }
 
@@ -920,11 +1097,13 @@ class BatchDownloadManager {
     this.cancelBtn.style.display = 'none';
     this.selectAllCb.disabled = false;
     this.delayInput.disabled = false;
+    this.subdirInput.disabled = false;
+    this.clearHistoryBtn.disabled = false;
     this.tasks.forEach(t => {
       t.checkbox.disabled = false;
       if (t.status === 'downloading') this._setTaskStatus(t, 'failed', '已取消');
     });
-    this.startBtn.textContent = '重新下载';
+    this.startBtn.textContent = '继续未完成';
     this._updateProgress();
   }
 }
