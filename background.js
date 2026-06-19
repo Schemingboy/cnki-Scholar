@@ -6,6 +6,7 @@ chrome.runtime.onInstalled.addListener(() => {
 // 下载历史记录，避免重复下载
 const DOWNLOAD_HISTORY_KEY = 'cnkiScholarDownloadHistory';
 const downloadHistory = new Set();
+const activeDownloads = new Map();
 
 const historyReady = new Promise(resolve => chrome.storage.local.get({ [DOWNLOAD_HISTORY_KEY]: [] }, (result) => {
   const history = result[DOWNLOAD_HISTORY_KEY] || [];
@@ -21,6 +22,64 @@ function saveDownloadHistory() {
 
 function buildHistoryKeys({ url, filename, articleKey }) {
   return [articleKey, filename, url].filter(Boolean);
+}
+
+function normalizePath(text) {
+  return (text || '').replace(/\\/g, '/').toLowerCase();
+}
+
+function basename(path) {
+  return normalizePath(path).split('/').pop() || '';
+}
+
+function checkDownloadedFiles(items) {
+  return new Promise(resolve => {
+    chrome.downloads.search({}, downloads => {
+      const records = Array.isArray(downloads) ? downloads : [];
+      const results = (items || []).map(item => {
+        const expectedPath = normalizePath(item.expectedPath);
+        const expectedName = basename(expectedPath);
+        const expectedSubdir = normalizePath(item.expectedSubdir);
+        const historyKeys = buildHistoryKeys(item);
+        const inHistory = historyKeys.some(key => downloadHistory.has(key));
+
+        const matches = records.filter(record => {
+          const file = normalizePath(record.filename);
+          return expectedName && basename(file) === expectedName && record.exists !== false;
+        });
+
+        const inTargetDir = matches.find(record => normalizePath(record.filename).includes(`/${expectedSubdir}/`));
+        if (inTargetDir) {
+          return {
+            id: item.id,
+            taskId: item.taskId,
+            status: 'downloaded',
+            filename: inTargetDir.filename,
+            inHistory
+          };
+        }
+
+        if (matches.length > 0) {
+          return {
+            id: item.id,
+            taskId: item.taskId,
+            status: 'wrong-location',
+            filename: matches[0].filename,
+            inHistory
+          };
+        }
+
+        return {
+          id: item.id,
+          taskId: item.taskId,
+          status: inHistory ? 'record-only' : 'missing',
+          inHistory
+        };
+      });
+
+      resolve({ results });
+    });
+  });
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -85,13 +144,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           console.error('[cnki-Scholar] 下载失败:', chrome.runtime.lastError.message);
           sendResponse({ error: chrome.runtime.lastError.message });
         } else {
-          historyKeys.forEach(key => downloadHistory.add(key));
-          saveDownloadHistory();
+          activeDownloads.set(downloadId, { url, filename, articleKey, historyKeys });
           console.log('[cnki-Scholar] 下载已启动, ID:', downloadId);
-          sendResponse({ downloadId });
+          sendResponse({ downloadId, filename });
         }
       });
     });
+    return true;
+  }
+
+  if (request.action === 'checkDownloadedFiles') {
+    historyReady
+      .then(() => checkDownloadedFiles(request.items))
+      .then(result => sendResponse(result));
     return true;
   }
 
@@ -108,13 +173,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // 监听下载状态变化，向content script通知
 chrome.downloads.onChanged.addListener((delta) => {
   if (delta.state) {
+    const active = activeDownloads.get(delta.id);
+    if (active && delta.state.current === 'complete') {
+      active.historyKeys.forEach(key => downloadHistory.add(key));
+      saveDownloadHistory();
+      activeDownloads.delete(delta.id);
+    } else if (active && delta.state.current === 'interrupted') {
+      activeDownloads.delete(delta.id);
+    }
+
     // 通过广播通知所有tab
     chrome.tabs.query({ url: "*://*.cnki.net/*" }, (tabs) => {
       tabs.forEach(tab => {
         chrome.tabs.sendMessage(tab.id, {
           action: 'downloadStateChanged',
           downloadId: delta.id,
-          state: delta.state.current
+          state: delta.state.current,
+          filename: active?.filename,
+          articleKey: active?.articleKey
         }).catch(() => {});
       });
     });

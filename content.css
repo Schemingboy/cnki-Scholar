@@ -54,6 +54,13 @@
 }
 
 /* ========== 批量下载按钮 ========== */
+.cnki-batch-entry-bar {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  padding: 8px 0;
+}
+
 .download-all-btn {
   margin-left: 10px;
   padding: 5px 10px;
@@ -290,6 +297,16 @@
 .batch-item-status.skipped {
   color: #6f42c1;
   background: #f2eafa;
+}
+
+.batch-item-status.wrongLocation {
+  color: #856404;
+  background: #fff3cd;
+}
+
+.batch-item-status.missing {
+  color: #495057;
+  background: #e9ecef;
 }
 
 .batch-item-status.failed {

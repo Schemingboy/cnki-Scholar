@@ -78,6 +78,9 @@ const journalCache = {
 const DEFAULT_DOWNLOAD_SUBDIR = 'CNKI';
 const SETTINGS_STORAGE_KEY = 'cnkiScholarSettings';
 const CAPTCHA_REQUIRED = '__CNKI_CAPTCHA_REQUIRED__';
+const DEFAULT_DELAY_SECONDS = 8;
+const MIN_DELAY_SECONDS = 6;
+const pendingDownloads = new Map();
 
 function normalizeText(text) {
   return (text || '').replace(/\s+/g, ' ').trim();
@@ -142,6 +145,12 @@ function buildDownloadFilename(title, url, subdir = DEFAULT_DOWNLOAD_SUBDIR) {
   return `${normalizeDownloadSubdir(subdir)}/${sanitizeFilename(title)}${getDownloadExtension(url)}`;
 }
 
+function getExpectedDownloadPaths(title, subdir = DEFAULT_DOWNLOAD_SUBDIR) {
+  const safeTitle = sanitizeFilename(title);
+  const safeSubdir = normalizeDownloadSubdir(subdir);
+  return ['.pdf', '.caj'].map(ext => `${safeSubdir}/${safeTitle}${ext}`);
+}
+
 function buildArticleKey(articleUrl, title) {
   try {
     const url = new URL(articleUrl, window.location.href);
@@ -165,6 +174,12 @@ function isVerificationPage(response, text) {
 function isVerificationUrl(url) {
   const lower = (url || '').toLowerCase();
   return lower.includes('checkcode') || lower.includes('captcha') || lower.includes('verify');
+}
+
+function normalizeDelaySeconds(input) {
+  const value = parseInt(input, 10);
+  if (!Number.isFinite(value)) return DEFAULT_DELAY_SECONDS;
+  return Math.max(MIN_DELAY_SECONDS, value);
 }
 
 function escapeHtml(text) {
@@ -375,6 +390,8 @@ async function addPdfDownloadButtons() {
           const result = await downloadPdf(pdfUrl, filename, buildArticleKey(link.href, title));
           if (result?.skipped) {
             alert(`已下载过这篇文章：\n${filename}`);
+          } else if (result?.downloadId) {
+            await waitForDownload(result.downloadId);
           }
         } else {
           alert('无法获取PDF下载链接');
@@ -399,20 +416,55 @@ function downloadPdf(url, filename, articleKey) {
       { action: 'download', url, filename, articleKey },
       (response) => {
         if (chrome.runtime.lastError) {
-          // 回退到新标签页打开
-          window.open(url, '_blank');
-          resolve({ fallback: true });
+          reject(new Error(chrome.runtime.lastError.message));
           return;
         }
         if (response?.error) {
-          // 回退
-          window.open(url, '_blank');
-          resolve({ fallback: true });
+          reject(new Error(response.error));
         } else if (response?.skipped) {
           resolve({ skipped: true });
         } else {
-          resolve({ downloadId: response.downloadId });
+          resolve({ downloadId: response.downloadId, filename: response.filename || filename });
         }
+      }
+    );
+  });
+}
+
+function waitForDownload(downloadId, timeoutMs = 10 * 60 * 1000) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      pendingDownloads.delete(downloadId);
+      reject(new Error('下载超时'));
+    }, timeoutMs);
+
+    pendingDownloads.set(downloadId, {
+      resolve: (message) => {
+        clearTimeout(timeoutId);
+        resolve(message);
+      },
+      reject: (error) => {
+        clearTimeout(timeoutId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function checkDownloadedFiles(items) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { action: 'checkDownloadedFiles', items },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        if (response?.error) {
+          reject(new Error(response.error));
+          return;
+        }
+        resolve(response?.results || []);
       }
     );
   });
@@ -718,6 +770,7 @@ class BatchDownloadManager {
     this.startBtn = null;
     this.pauseBtn = null;
     this.cancelBtn = null;
+    this.checkBtn = null;
     this.clearHistoryBtn = null;
     this.selectAllCb = null;
     this.countEl = null;
@@ -748,10 +801,11 @@ class BatchDownloadManager {
         <label><input type="checkbox" class="cnki-row-checkbox batch-select-all" checked /> 全选</label>
         <span class="batch-count">已选 0 篇</span>
         <button class="batch-btn batch-btn-primary batch-start-btn">开始下载</button>
+        <button class="batch-btn batch-btn-secondary batch-check-btn">核查</button>
         <button class="batch-btn batch-btn-warning batch-pause-btn" style="display:none">暂停</button>
         <button class="batch-btn batch-btn-danger batch-cancel-btn" style="display:none">取消</button>
         <div class="batch-delay-control">
-          间隔 <input type="number" class="batch-delay-input" value="8" min="3" max="30" /> 秒
+          间隔 <input type="number" class="batch-delay-input" value="${DEFAULT_DELAY_SECONDS}" min="${MIN_DELAY_SECONDS}" max="30" /> 秒
         </div>
         <div class="batch-save-control">
           <span>保存到 下载目录/</span>
@@ -773,6 +827,7 @@ class BatchDownloadManager {
     this.selectAllCb  = this.panel.querySelector('.batch-select-all');
     this.countEl      = this.panel.querySelector('.batch-count');
     this.startBtn     = this.panel.querySelector('.batch-start-btn');
+    this.checkBtn     = this.panel.querySelector('.batch-check-btn');
     this.pauseBtn     = this.panel.querySelector('.batch-pause-btn');
     this.cancelBtn    = this.panel.querySelector('.batch-cancel-btn');
     this.clearHistoryBtn = this.panel.querySelector('.batch-clear-history-btn');
@@ -797,6 +852,7 @@ class BatchDownloadManager {
     });
 
     this.startBtn.addEventListener('click', () => this._startDownload());
+    this.checkBtn.addEventListener('click', () => this._checkSelectedDownloads());
     this.pauseBtn.addEventListener('click', () => this._togglePause());
     this.cancelBtn.addEventListener('click', () => this._cancel());
     this.clearHistoryBtn.addEventListener('click', () => this._clearDownloadHistory());
@@ -875,12 +931,13 @@ class BatchDownloadManager {
       const fullTitle = normalizeText(link.textContent);
       const title = fullTitle.substring(0, 50);
       const task = {
+        id: `task-${this.tasks.length}`,
         link,
         row,
         title: fullTitle || title,
         displayTitle: title,
         checkbox: cb,
-        status: 'pending',   // pending | downloading | success | skipped | failed | captcha
+        status: 'pending',   // pending | downloading | success | skipped | wrongLocation | missing | failed | captcha
         statusEl: null,
       };
 
@@ -921,14 +978,70 @@ class BatchDownloadManager {
 
   /** 获取选中的任务 */
   _getSelected() {
-    return this.tasks.filter(t => t.checkbox.checked && t.status === 'pending');
+    return this.tasks.filter(t => t.checkbox.checked && ['pending', 'missing'].includes(t.status));
+  }
+
+  _buildCheckItems(tasks, downloadSubdir) {
+    return tasks.flatMap((task) => {
+      const articleKey = buildArticleKey(task.link.href, task.title);
+      return getExpectedDownloadPaths(task.title, downloadSubdir).map(expectedPath => ({
+        id: `${task.id}|${expectedPath}`,
+        taskId: task.id,
+        title: task.title,
+        articleKey,
+        filename: expectedPath,
+        expectedPath,
+        expectedSubdir: downloadSubdir,
+      }));
+    });
+  }
+
+  async _checkSelectedDownloads() {
+    const selected = this.tasks.filter(t => t.checkbox.checked);
+    if (selected.length === 0) return { downloaded: 0, wrongLocation: 0, missing: 0 };
+
+    const downloadSubdir = await this._saveSubdirInput();
+    const items = this._buildCheckItems(selected, downloadSubdir);
+    const results = await checkDownloadedFiles(items);
+    const grouped = new Map();
+
+    results.forEach(result => {
+      const taskId = result.taskId || result.id.split('|')[0];
+      if (!grouped.has(taskId)) grouped.set(taskId, []);
+      grouped.get(taskId).push(result);
+    });
+
+    let downloaded = 0;
+    let wrongLocation = 0;
+    let missing = 0;
+
+    selected.forEach((task) => {
+      const taskResults = grouped.get(task.id) || [];
+      const downloadedResult = taskResults.find(r => r.status === 'downloaded');
+      const wrongResult = taskResults.find(r => r.status === 'wrong-location');
+
+      if (downloadedResult) {
+        this._setTaskStatus(task, 'skipped', '已下载过');
+        downloaded++;
+      } else if (wrongResult) {
+        this._setTaskStatus(task, 'wrongLocation', '位置不符');
+        wrongLocation++;
+      } else {
+        this._setTaskStatus(task, 'missing', '未找到');
+        missing++;
+      }
+    });
+
+    this.statsEl.textContent = '核查完成';
+    this.statsDetail.textContent = `已下载 ${downloaded} / 位置不符 ${wrongLocation} / 未找到 ${missing}`;
+    return { downloaded, wrongLocation, missing };
   }
 
   /** 更新单个任务状态 */
   _setTaskStatus(task, status, detail) {
     task.status = status;
-    const icons = { pending: '⬜', downloading: '⏳', success: '✅', skipped: '↩', failed: '❌', captcha: '🚫' };
-    const labels = { pending: '待下载', downloading: '下载中', success: '成功', skipped: '已跳过', failed: '失败', captcha: '需验证' };
+    const icons = { pending: '⬜', downloading: '⏳', success: '✅', skipped: '↩', wrongLocation: '⚠', missing: '○', failed: '❌', captcha: '🚫' };
+    const labels = { pending: '待下载', downloading: '下载中', success: '成功', skipped: '已跳过', wrongLocation: '位置不符', missing: '未找到', failed: '失败', captcha: '需验证' };
     task.iconEl.textContent = icons[status] || '⬜';
     task.statusEl.textContent = detail || labels[status];
     task.statusEl.className = `batch-item-status ${status}`;
@@ -940,9 +1053,11 @@ class BatchDownloadManager {
     const total = this.tasks.filter(t => t.checkbox.checked).length;
     if (total === 0) return;
 
-    const done = this.tasks.filter(t => t.checkbox.checked && ['success','skipped','failed','captcha'].includes(t.status)).length;
+    const done = this.tasks.filter(t => t.checkbox.checked && ['success','skipped','wrongLocation','missing','failed','captcha'].includes(t.status)).length;
     const success = this.tasks.filter(t => t.status === 'success').length;
     const skipped = this.tasks.filter(t => t.status === 'skipped').length;
+    const wrongLocation = this.tasks.filter(t => t.status === 'wrongLocation').length;
+    const missing = this.tasks.filter(t => t.status === 'missing').length;
     const failed = this.tasks.filter(t => t.status === 'failed').length;
     const captcha = this.tasks.filter(t => t.status === 'captcha').length;
 
@@ -955,6 +1070,8 @@ class BatchDownloadManager {
     this.statsEl.textContent = this.paused ? '⏸ 已暂停' : (this.cancelled ? '⏹ 已取消' : `${pct}% 完成`);
     let detail = `✅${success}`;
     if (skipped > 0) detail += ` ↩${skipped}`;
+    if (wrongLocation > 0) detail += ` ⚠${wrongLocation}`;
+    if (missing > 0) detail += ` ○${missing}`;
     if (failed > 0) detail += ` ❌${failed}`;
     if (captcha > 0) detail += ` 🚫${captcha}`;
     this.statsDetail.textContent = detail;
@@ -962,8 +1079,27 @@ class BatchDownloadManager {
 
   /** 开始下载 */
   async _startDownload() {
-    const selected = this._getSelected();
-    if (selected.length === 0) return;
+    const checked = this.tasks.filter(t => t.checkbox.checked);
+    if (checked.length === 0) return;
+
+    this.startBtn.disabled = true;
+    this.checkBtn.disabled = true;
+    this.statsEl.textContent = '正在核查已下载记录...';
+
+    try {
+      await this._checkSelectedDownloads();
+    } catch (error) {
+      console.error('[cnki-Scholar] 下载前核查失败:', error);
+      this.statsEl.textContent = '核查失败，继续下载未完成项';
+    }
+
+    let selected = this._getSelected();
+    if (selected.length === 0) {
+      this.startBtn.disabled = false;
+      this.checkBtn.disabled = false;
+      this.statsEl.textContent = '没有需要下载的论文';
+      return;
+    }
 
     this.running = true;
     this.paused = false;
@@ -977,10 +1113,11 @@ class BatchDownloadManager {
     this.selectAllCb.disabled = true;
     this.delayInput.disabled = true;
     this.subdirInput.disabled = true;
+    this.checkBtn.disabled = true;
     this.clearHistoryBtn.disabled = true;
     this.tasks.forEach(t => { t.checkbox.disabled = true; });
 
-    const baseDelay = parseInt(this.delayInput.value) || 8;
+    this.delayInput.value = normalizeDelaySeconds(this.delayInput.value);
     const downloadSubdir = await this._saveSubdirInput();
     let successCount = 0;
     let failCount = 0;
@@ -1011,8 +1148,13 @@ class BatchDownloadManager {
 
           if (result?.skipped) {
             this._setTaskStatus(task, 'skipped', '已下载过');
-          } else {
+          } else if (result?.downloadId) {
+            await waitForDownload(result.downloadId);
             this._setTaskStatus(task, 'success');
+          } else {
+            this._setTaskStatus(task, 'failed', '未启动');
+            failCount++;
+            continue;
           }
           successCount++;
         } else {
@@ -1022,19 +1164,7 @@ class BatchDownloadManager {
       } catch (error) {
         if (this.cancelled) break;
         if (error?.message === CAPTCHA_REQUIRED) {
-          this._setTaskStatus(task, 'captcha', '完成验证后继续');
-          this.paused = true;
-          this.pauseBtn.textContent = '继续';
-          this._updateProgress();
-          alert('检测到知网验证。请在页面里手动完成验证，完成后回到这个面板点“继续”，扩展会重试当前这篇。');
-
-          while (this.paused && !this.cancelled) {
-            await new Promise(r => setTimeout(r, 500));
-          }
-
-          if (this.cancelled) break;
-          this._setTaskStatus(task, 'pending', '待重试');
-          index -= 1;
+          this._setTaskStatus(task, 'captcha', '需人工处理');
           continue;
         } else {
           this._setTaskStatus(task, 'failed', error.message.substring(0, 20));
@@ -1057,7 +1187,9 @@ class BatchDownloadManager {
 
       // 请求间隔（随机浮动 ±30%）
       if (!this.cancelled) {
-        const delay = baseDelay * 1000 * (0.7 + Math.random() * 0.6);
+        const delaySeconds = normalizeDelaySeconds(this.delayInput.value);
+        this.delayInput.value = delaySeconds;
+        const delay = delaySeconds * 1000 * (0.7 + Math.random() * 0.6);
         await new Promise(r => setTimeout(r, delay));
       }
     }
@@ -1065,11 +1197,13 @@ class BatchDownloadManager {
     // 下载完成
     this.running = false;
     this.startBtn.style.display = '';
+    this.startBtn.disabled = false;
     this.pauseBtn.style.display = 'none';
     this.cancelBtn.style.display = 'none';
     this.selectAllCb.disabled = false;
     this.delayInput.disabled = false;
     this.subdirInput.disabled = false;
+    this.checkBtn.disabled = false;
     this.clearHistoryBtn.disabled = false;
     this.tasks.forEach(t => { t.checkbox.disabled = false; });
 
@@ -1083,6 +1217,10 @@ class BatchDownloadManager {
   _togglePause() {
     this.paused = !this.paused;
     this.pauseBtn.textContent = this.paused ? '继续' : '暂停';
+    this.delayInput.disabled = !this.paused;
+    if (!this.paused) {
+      this.delayInput.value = normalizeDelaySeconds(this.delayInput.value);
+    }
     this._updateProgress();
   }
 
@@ -1099,6 +1237,8 @@ class BatchDownloadManager {
     this.delayInput.disabled = false;
     this.subdirInput.disabled = false;
     this.clearHistoryBtn.disabled = false;
+    pendingDownloads.forEach(waiter => waiter.reject(new Error('已取消')));
+    pendingDownloads.clear();
     this.tasks.forEach(t => {
       t.checkbox.disabled = false;
       if (t.status === 'downloading') this._setTaskStatus(t, 'failed', '已取消');
@@ -1112,13 +1252,25 @@ class BatchDownloadManager {
 let batchManager = null;
 
 function addDownloadAllButton() {
-  const pagesDiv = document.querySelector(SELECTORS.pagesDiv);
-  if (!pagesDiv || pagesDiv.querySelector('.download-all-btn')) return;
+  if (document.querySelector('.download-all-btn')) return;
+
+  const firstArticle = getArticleLinks()[0];
+  const table = firstArticle?.closest('table');
+  const fallback = document.querySelector(SELECTORS.pagesDiv);
+  const target = table?.parentElement || fallback;
+  if (!target) return;
 
   const btn = document.createElement('button');
   btn.className = 'download-all-btn';
   btn.textContent = '📥 批量下载';
-  pagesDiv.appendChild(btn);
+  if (table?.parentElement) {
+    const bar = document.createElement('div');
+    bar.className = 'cnki-batch-entry-bar';
+    bar.appendChild(btn);
+    table.parentElement.insertBefore(bar, table);
+  } else {
+    fallback.appendChild(btn);
+  }
 
   btn.addEventListener('click', () => {
     if (!batchManager) batchManager = new BatchDownloadManager();
@@ -1168,5 +1320,13 @@ observer.observe(document.body, { childList: true, subtree: true });
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'downloadStateChanged') {
     console.log(`[cnki-Scholar] 下载 ${msg.downloadId} 状态: ${msg.state}`);
+    const waiter = pendingDownloads.get(msg.downloadId);
+    if (waiter && msg.state === 'complete') {
+      pendingDownloads.delete(msg.downloadId);
+      waiter.resolve(msg);
+    } else if (waiter && msg.state === 'interrupted') {
+      pendingDownloads.delete(msg.downloadId);
+      waiter.reject(new Error('下载中断'));
+    }
   }
 });
