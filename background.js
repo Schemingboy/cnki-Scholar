@@ -84,7 +84,7 @@ function checkDownloadedFiles(items) {
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // 处理跨域数据请求（Gitee期刊数据）
-  if (request.url) {
+  if (request.url && !request.action) {
     const maxRetries = request.retry || 3;
     let attempts = 0;
 
