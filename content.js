@@ -870,7 +870,7 @@ class BatchDownloadManager {
         title: fullTitle || title,
         displayTitle: title,
         checkbox: cb,
-        status: 'pending',   // pending | downloading | success | skipped | wrongLocation | missing | failed | captcha
+        status: 'pending',   // pending | downloading | triggered | skipped | wrongLocation | missing | failed | captcha
         statusEl: null,
       };
 
@@ -973,8 +973,8 @@ class BatchDownloadManager {
   /** 更新单个任务状态 */
   _setTaskStatus(task, status, detail) {
     task.status = status;
-    const icons = { pending: '⬜', downloading: '⏳', success: '✅', skipped: '↩', wrongLocation: '⚠', missing: '○', failed: '❌', captcha: '🚫' };
-    const labels = { pending: '待下载', downloading: '下载中', success: '成功', skipped: '已跳过', wrongLocation: '位置不符', missing: '未找到', failed: '失败', captcha: '需验证' };
+    const icons = { pending: '⬜', downloading: '⏳', triggered: '✅', skipped: '↩', wrongLocation: '⚠', missing: '○', failed: '❌', captcha: '🚫' };
+    const labels = { pending: '待下载', downloading: '下载中', triggered: '已触发', skipped: '已跳过', wrongLocation: '位置不符', missing: '未找到', failed: '失败', captcha: '需验证' };
     task.iconEl.textContent = icons[status] || '⬜';
     task.statusEl.textContent = detail || labels[status];
     task.statusEl.className = `batch-item-status ${status}`;
@@ -986,8 +986,8 @@ class BatchDownloadManager {
     const total = this.tasks.filter(t => t.checkbox.checked).length;
     if (total === 0) return;
 
-    const done = this.tasks.filter(t => t.checkbox.checked && ['success','skipped','wrongLocation','missing','failed','captcha'].includes(t.status)).length;
-    const success = this.tasks.filter(t => t.status === 'success').length;
+    const done = this.tasks.filter(t => t.checkbox.checked && ['triggered','skipped','wrongLocation','missing','failed','captcha'].includes(t.status)).length;
+    const triggered = this.tasks.filter(t => t.status === 'triggered').length;
     const skipped = this.tasks.filter(t => t.status === 'skipped').length;
     const wrongLocation = this.tasks.filter(t => t.status === 'wrongLocation').length;
     const missing = this.tasks.filter(t => t.status === 'missing').length;
@@ -998,10 +998,10 @@ class BatchDownloadManager {
     this.progressFill.style.width = `${pct}%`;
     this.progressFill.className = 'batch-progress-fill' +
       (this.paused ? ' paused' : '') +
-      (failed > success && done > 0 ? ' error' : '');
+      (failed > triggered && done > 0 ? ' error' : '');
 
     this.statsEl.textContent = this.paused ? '⏸ 已暂停' : (this.cancelled ? '⏹ 已取消' : `${pct}% 完成`);
-    let detail = `✅${success}`;
+    let detail = `已触发 ${triggered}`;
     if (skipped > 0) detail += ` ↩${skipped}`;
     if (wrongLocation > 0) detail += ` ⚠${wrongLocation}`;
     if (missing > 0) detail += ` ○${missing}`;
@@ -1052,7 +1052,7 @@ class BatchDownloadManager {
 
     this.delayInput.value = normalizeDelaySeconds(this.delayInput.value);
     const downloadSubdir = await this._saveSubdirInput();
-    let successCount = 0;
+    let triggeredCount = 0;
     let failCount = 0;
 
     for (let index = 0; index < selected.length; index++) {
@@ -1079,13 +1079,13 @@ class BatchDownloadManager {
           const result = await downloadPdf(pdfUrl);
 
           if (result?.opened) {
-            this._setTaskStatus(task, 'success');
+            this._setTaskStatus(task, 'triggered');
           } else {
             this._setTaskStatus(task, 'failed', '未启动');
             failCount++;
             continue;
           }
-          successCount++;
+          triggeredCount++;
         } else {
           this._setTaskStatus(task, 'failed', '无下载链接');
           failCount++;
@@ -1102,7 +1102,7 @@ class BatchDownloadManager {
       }
 
       // 连续失败 3 次，自动暂停提示
-      if (failCount >= 3 && successCount === 0) {
+      if (failCount >= 3 && triggeredCount === 0) {
         this.paused = true;
         this.pauseBtn.textContent = '继续';
         this._updateProgress();
@@ -1114,12 +1114,11 @@ class BatchDownloadManager {
         if (this.cancelled) break;
       }
 
-      // 请求间隔（随机浮动 ±30%）
+      // 请求间隔
       if (!this.cancelled) {
         const delaySeconds = normalizeDelaySeconds(this.delayInput.value);
         this.delayInput.value = delaySeconds;
-        const delay = delaySeconds * 1000 * (0.7 + Math.random() * 0.6);
-        await new Promise(r => setTimeout(r, delay));
+        await new Promise(r => setTimeout(r, delaySeconds * 1000));
       }
     }
 

@@ -6,19 +6,11 @@ chrome.runtime.onInstalled.addListener(() => {
 // 下载历史记录，避免重复下载
 const DOWNLOAD_HISTORY_KEY = 'cnkiScholarDownloadHistory';
 const downloadHistory = new Set();
-const activeDownloads = new Map();
-
 const historyReady = new Promise(resolve => chrome.storage.local.get({ [DOWNLOAD_HISTORY_KEY]: [] }, (result) => {
   const history = result[DOWNLOAD_HISTORY_KEY] || [];
   history.forEach(item => downloadHistory.add(item));
   resolve();
 }));
-
-function saveDownloadHistory() {
-  chrome.storage.local.set({
-    [DOWNLOAD_HISTORY_KEY]: Array.from(downloadHistory).slice(-5000)
-  });
-}
 
 function buildHistoryKeys({ url, filename, articleKey }) {
   return [articleKey, filename, url].filter(Boolean);
@@ -30,30 +22,6 @@ function normalizePath(text) {
 
 function basename(path) {
   return normalizePath(path).split('/').pop() || '';
-}
-
-function isHtmlDownload(download) {
-  return (
-    /\.(html?|shtml)$/.test(basename(download?.filename)) ||
-    (download?.mime || '').toLowerCase().includes('text/html')
-  );
-}
-
-function notifyDownloadState(downloadId, state, active, error) {
-  chrome.tabs.query({ url: "*://*.cnki.net/*" }, (tabs) => {
-    tabs.forEach(tab => {
-      chrome.tabs.sendMessage(tab.id, {
-        action: 'downloadStateChanged',
-        downloadId,
-        state,
-        filename: active?.filename,
-        articleKey: active?.articleKey,
-        error
-      }, () => {
-        void chrome.runtime.lastError;
-      });
-    });
-  });
 }
 
 function checkDownloadedFiles(items) {
@@ -146,37 +114,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // 处理文件下载请求
-  if (request.action === 'download') {
-    historyReady.then(() => {
-      const { url, filename, articleKey } = request;
-      const historyKeys = buildHistoryKeys({ url, filename, articleKey });
-
-      // 去重检查
-      if (historyKeys.some(key => downloadHistory.has(key))) {
-        sendResponse({ skipped: true, reason: '已下载' });
-        return;
-      }
-
-      chrome.downloads.download({
-        url: url,
-        filename: filename || undefined,
-        conflictAction: 'uniquify',
-        saveAs: false
-      }, (downloadId) => {
-        if (chrome.runtime.lastError) {
-          console.error('[cnki-Scholar] 下载失败:', chrome.runtime.lastError.message);
-          sendResponse({ error: chrome.runtime.lastError.message });
-        } else {
-          activeDownloads.set(downloadId, { url, filename, articleKey, historyKeys });
-          console.log('[cnki-Scholar] 下载已启动, ID:', downloadId);
-          sendResponse({ downloadId, filename });
-        }
-      });
-    });
-    return true;
-  }
-
   if (request.action === 'checkDownloadedFiles') {
     historyReady
       .then(() => checkDownloadedFiles(request.items))
@@ -191,33 +128,5 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       chrome.storage.local.remove(DOWNLOAD_HISTORY_KEY, () => sendResponse({ ok: true }));
     });
     return true;
-  }
-});
-
-// 监听下载状态变化，向content script通知
-chrome.downloads.onChanged.addListener((delta) => {
-  if (delta.state) {
-    const active = activeDownloads.get(delta.id);
-    if (active && delta.state.current === 'complete') {
-      chrome.downloads.search({ id: delta.id }, (downloads) => {
-        const download = downloads?.[0];
-        if (isHtmlDownload(download)) {
-          chrome.downloads.removeFile(delta.id, () => void chrome.runtime.lastError);
-          activeDownloads.delete(delta.id);
-          notifyDownloadState(delta.id, 'interrupted', active, '知网返回的是网页，不是PDF文件');
-          return;
-        }
-
-        active.historyKeys.forEach(key => downloadHistory.add(key));
-        saveDownloadHistory();
-        activeDownloads.delete(delta.id);
-        notifyDownloadState(delta.id, 'complete', active);
-      });
-      return;
-    } else if (active && delta.state.current === 'interrupted') {
-      activeDownloads.delete(delta.id);
-    }
-
-    notifyDownloadState(delta.id, delta.state.current, active);
   }
 });
