@@ -136,7 +136,6 @@ function saveDownloadSubdir(input) {
 
 function getDownloadExtension(url) {
   const lower = (url || '').toLowerCase();
-  if (lower.includes('caj')) return '.caj';
   if (lower.includes('pdf')) return '.pdf';
   return '.pdf';
 }
@@ -148,7 +147,7 @@ function buildDownloadFilename(title, url, subdir = DEFAULT_DOWNLOAD_SUBDIR) {
 function getExpectedDownloadPaths(title, subdir = DEFAULT_DOWNLOAD_SUBDIR) {
   const safeTitle = sanitizeFilename(title);
   const safeSubdir = normalizeDownloadSubdir(subdir);
-  return ['.pdf', '.caj'].map(ext => `${safeSubdir}/${safeTitle}${ext}`);
+  return [`${safeSubdir}/${safeTitle}.pdf`];
 }
 
 function buildArticleKey(articleUrl, title) {
@@ -386,12 +385,10 @@ async function addPdfDownloadButtons() {
           const title = titleLink?.textContent;
           const filename = buildDownloadFilename(title, pdfUrl, settings.downloadSubdir);
 
-          // 使用 chrome.downloads API（通过 background.js）
+          // 让知网页面触发原生下载，background.js 只负责命名和记录。
           const result = await downloadPdf(pdfUrl, filename, buildArticleKey(link.href, title));
           if (result?.skipped) {
             alert(`已下载过这篇文章：\n${filename}`);
-          } else if (result?.downloadId) {
-            await waitForDownload(result.downloadId);
           }
         } else {
           alert('无法获取PDF下载链接');
@@ -408,12 +405,13 @@ async function addPdfDownloadButtons() {
 }
 
 /**
- * 通过 background.js 下载 PDF
+ * 触发知网页面的原生 PDF 下载。
+ * background.js 会把下一次匹配的下载重命名到配置的子目录。
  */
-function downloadPdf(url, filename, articleKey) {
-  return new Promise((resolve, reject) => {
+async function downloadPdf(url, filename, articleKey) {
+  const prepared = await new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
-      { action: 'download', url, filename, articleKey },
+      { action: 'prepareNativeDownload', url, filename, articleKey },
       (response) => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
@@ -424,27 +422,45 @@ function downloadPdf(url, filename, articleKey) {
         } else if (response?.skipped) {
           resolve({ skipped: true });
         } else {
-          resolve({ downloadId: response.downloadId, filename: response.filename || filename });
+          resolve({ ok: true });
         }
       }
     );
   });
+
+  if (prepared?.skipped) return prepared;
+
+  const waitPromise = waitForDownload(articleKey);
+  const opened = window.open(url, '_blank');
+  if (!opened) {
+    pendingDownloads.delete(articleKey);
+    throw new Error('浏览器阻止了下载窗口，请允许弹出窗口后重试');
+  }
+
+  const message = await waitPromise;
+  return {
+    completed: true,
+    downloadId: message.downloadId,
+    filename: message.filename || filename,
+  };
 }
 
-function waitForDownload(downloadId, timeoutMs = 10 * 60 * 1000) {
+function waitForDownload(downloadKey, timeoutMs = 2 * 60 * 1000) {
   return new Promise((resolve, reject) => {
     const timeoutId = setTimeout(() => {
-      pendingDownloads.delete(downloadId);
-      reject(new Error('下载超时'));
+      pendingDownloads.delete(downloadKey);
+      cancelNativeDownload(downloadKey);
+      reject(new Error('未检测到PDF下载完成，请确认是否弹出验证或下载被浏览器拦截'));
     }, timeoutMs);
 
-    pendingDownloads.set(downloadId, {
+    pendingDownloads.set(downloadKey, {
       resolve: (message) => {
         clearTimeout(timeoutId);
         resolve(message);
       },
       reject: (error) => {
         clearTimeout(timeoutId);
+        cancelNativeDownload(downloadKey);
         reject(error);
       },
     });
@@ -470,8 +486,14 @@ function checkDownloadedFiles(items) {
   });
 }
 
+function cancelNativeDownload(articleKey) {
+  chrome.runtime.sendMessage({ action: 'cancelNativeDownload', articleKey }, () => {
+    void chrome.runtime.lastError;
+  });
+}
+
 /**
- * 获取文章页面的 PDF/CAJ 下载链接
+ * 获取文章页面的 PDF 下载链接
  */
 async function fetchPdfUrl(articleUrl, row) {
   try {
@@ -485,11 +507,11 @@ async function fetchPdfUrl(articleUrl, row) {
 
     const doc = new DOMParser().parseFromString(text, 'text/html');
 
-    // PDF/CAJ 下载按钮
+    // PDF 下载按钮
     const isThesis = row?.querySelector('img[src*="thesis"]') || articleUrl.includes('CDMD');
 
     if (isThesis) {
-      const thesisLink = doc.querySelector('.btn-dlcaj, .btn-dlpdf');
+      const thesisLink = doc.querySelector('.btn-dlpdf');
       if (thesisLink?.href) {
         try {
           const url = new URL(thesisLink.href, articleUrl);
@@ -500,8 +522,8 @@ async function fetchPdfUrl(articleUrl, row) {
         }
       }
     } else {
-      const downloadBtns = doc.querySelectorAll('#pdfDown, #cajDown');
-      let pdfLink = null, cajLink = null;
+      const downloadBtns = doc.querySelectorAll('#pdfDown');
+      let pdfLink = null;
       for (const btn of downloadBtns) {
         if (!btn?.href) continue;
         try {
@@ -510,13 +532,11 @@ async function fetchPdfUrl(articleUrl, row) {
           if (url.protocol !== 'http:' && url.protocol !== 'https:') continue;
           const text = (btn.textContent || '').trim().toLowerCase();
           if (text.includes('pdf') && !pdfLink) pdfLink = url.href;
-          else if (text.includes('caj') && !cajLink) cajLink = url.href;
         } catch (error) {
           if (error?.message === CAPTCHA_REQUIRED) throw error;
         }
       }
       if (pdfLink) return pdfLink;
-      if (cajLink) return cajLink;
     }
 
     return null;
@@ -1127,8 +1147,7 @@ class BatchDownloadManager {
 
           if (result?.skipped) {
             this._setTaskStatus(task, 'skipped', '已下载过');
-          } else if (result?.downloadId) {
-            await waitForDownload(result.downloadId);
+          } else if (result?.completed) {
             this._setTaskStatus(task, 'success');
           } else {
             this._setTaskStatus(task, 'failed', '未启动');
@@ -1299,12 +1318,14 @@ observer.observe(document.body, { childList: true, subtree: true });
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'downloadStateChanged') {
     console.log(`[cnki-Scholar] 下载 ${msg.downloadId} 状态: ${msg.state}`);
-    const waiter = pendingDownloads.get(msg.downloadId);
+    const keys = [msg.articleKey, msg.downloadId].filter(Boolean);
+    const waiterKey = keys.find(key => pendingDownloads.has(key));
+    const waiter = waiterKey ? pendingDownloads.get(waiterKey) : null;
     if (waiter && msg.state === 'complete') {
-      pendingDownloads.delete(msg.downloadId);
+      pendingDownloads.delete(waiterKey);
       waiter.resolve(msg);
     } else if (waiter && msg.state === 'interrupted') {
-      pendingDownloads.delete(msg.downloadId);
+      pendingDownloads.delete(waiterKey);
       waiter.reject(new Error(msg.error || '下载中断'));
     }
   }
