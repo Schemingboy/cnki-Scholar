@@ -32,6 +32,30 @@ function basename(path) {
   return normalizePath(path).split('/').pop() || '';
 }
 
+function isHtmlDownload(download) {
+  return (
+    /\.(html?|shtml)$/.test(basename(download?.filename)) ||
+    (download?.mime || '').toLowerCase().includes('text/html')
+  );
+}
+
+function notifyDownloadState(downloadId, state, active, error) {
+  chrome.tabs.query({ url: "*://*.cnki.net/*" }, (tabs) => {
+    tabs.forEach(tab => {
+      chrome.tabs.sendMessage(tab.id, {
+        action: 'downloadStateChanged',
+        downloadId,
+        state,
+        filename: active?.filename,
+        articleKey: active?.articleKey,
+        error
+      }, () => {
+        void chrome.runtime.lastError;
+      });
+    });
+  });
+}
+
 function checkDownloadedFiles(items) {
   return new Promise(resolve => {
     chrome.downloads.search({}, downloads => {
@@ -175,26 +199,25 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (delta.state) {
     const active = activeDownloads.get(delta.id);
     if (active && delta.state.current === 'complete') {
-      active.historyKeys.forEach(key => downloadHistory.add(key));
-      saveDownloadHistory();
-      activeDownloads.delete(delta.id);
+      chrome.downloads.search({ id: delta.id }, (downloads) => {
+        const download = downloads?.[0];
+        if (isHtmlDownload(download)) {
+          chrome.downloads.removeFile(delta.id, () => void chrome.runtime.lastError);
+          activeDownloads.delete(delta.id);
+          notifyDownloadState(delta.id, 'interrupted', active, '知网返回的是网页，不是PDF/CAJ文件');
+          return;
+        }
+
+        active.historyKeys.forEach(key => downloadHistory.add(key));
+        saveDownloadHistory();
+        activeDownloads.delete(delta.id);
+        notifyDownloadState(delta.id, 'complete', active);
+      });
+      return;
     } else if (active && delta.state.current === 'interrupted') {
       activeDownloads.delete(delta.id);
     }
 
-    // 通过广播通知所有tab
-    chrome.tabs.query({ url: "*://*.cnki.net/*" }, (tabs) => {
-      tabs.forEach(tab => {
-        chrome.tabs.sendMessage(tab.id, {
-          action: 'downloadStateChanged',
-          downloadId: delta.id,
-          state: delta.state.current,
-          filename: active?.filename,
-          articleKey: active?.articleKey
-        }, () => {
-          void chrome.runtime.lastError;
-        });
-      });
-    });
+    notifyDownloadState(delta.id, delta.state.current, active);
   }
 });

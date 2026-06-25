@@ -1305,7 +1305,7 @@ chrome.runtime.onMessage.addListener((msg) => {
       waiter.resolve(msg);
     } else if (waiter && msg.state === 'interrupted') {
       pendingDownloads.delete(msg.downloadId);
-      waiter.reject(new Error('下载中断'));
+      waiter.reject(new Error(msg.error || '下载中断'));
     }
   }
 });
