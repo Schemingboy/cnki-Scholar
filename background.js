@@ -191,7 +191,9 @@ chrome.downloads.onChanged.addListener((delta) => {
           state: delta.state.current,
           filename: active?.filename,
           articleKey: active?.articleKey
-        }).catch(() => {});
+        }, () => {
+          void chrome.runtime.lastError;
+        });
       });
     });
   }
