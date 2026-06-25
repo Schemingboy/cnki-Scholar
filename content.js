@@ -785,7 +785,7 @@ class BatchDownloadManager {
     });
 
     this.startBtn.addEventListener('click', () => this._startDownload());
-    this.checkBtn.addEventListener('click', () => this._checkSelectedDownloads());
+    this.checkBtn.addEventListener('click', () => this._runManualCheck());
     this.pauseBtn.addEventListener('click', () => this._togglePause());
     this.cancelBtn.addEventListener('click', () => this._cancel());
     this.clearHistoryBtn.addEventListener('click', () => this._clearDownloadHistory());
@@ -929,9 +929,29 @@ class BatchDownloadManager {
     });
   }
 
+  async _runManualCheck() {
+    this.checkBtn.disabled = true;
+    this.statsEl.textContent = '正在核查...';
+    this.statsDetail.textContent = '';
+
+    try {
+      await this._checkSelectedDownloads();
+    } catch (error) {
+      console.error('[cnki-Scholar] 核查失败:', error);
+      this.statsEl.textContent = '核查失败';
+      this.statsDetail.textContent = error.message || '请重新加载扩展后再试';
+    } finally {
+      this.checkBtn.disabled = false;
+    }
+  }
+
   async _checkSelectedDownloads() {
     const selected = this.tasks.filter(t => t.checkbox.checked);
-    if (selected.length === 0) return { downloaded: 0, wrongLocation: 0, missing: 0 };
+    if (selected.length === 0) {
+      this.statsEl.textContent = '没有勾选论文';
+      this.statsDetail.textContent = '';
+      return { downloaded: 0, wrongLocation: 0, missing: 0 };
+    }
 
     const downloadSubdir = await this._saveSubdirInput();
     const items = this._buildCheckItems(selected, downloadSubdir);

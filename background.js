@@ -24,6 +24,14 @@ function basename(path) {
   return normalizePath(path).split('/').pop() || '';
 }
 
+function normalizeTitleForFile(text) {
+  return normalizePath(text)
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\.+$/g, '')
+    .slice(0, 120)
+    .trim();
+}
+
 function checkDownloadedFiles(items) {
   return new Promise(resolve => {
     chrome.downloads.search({}, downloads => {
@@ -31,31 +39,25 @@ function checkDownloadedFiles(items) {
       const results = (items || []).map(item => {
         const expectedPath = normalizePath(item.expectedPath);
         const expectedName = basename(expectedPath);
-        const expectedSubdir = normalizePath(item.expectedSubdir);
+        const title = normalizeTitleForFile(item.title);
         const historyKeys = buildHistoryKeys(item);
         const inHistory = historyKeys.some(key => downloadHistory.has(key));
 
         const matches = records.filter(record => {
           const file = normalizePath(record.filename);
-          return expectedName && basename(file) === expectedName && record.exists !== false;
+          if (record.exists === false || !/\.pdf$/i.test(file)) return false;
+          const fileName = basename(file);
+          return (
+            (expectedName && fileName === expectedName) ||
+            (title && fileName.includes(title))
+          );
         });
-
-        const inTargetDir = matches.find(record => normalizePath(record.filename).includes(`/${expectedSubdir}/`));
-        if (inTargetDir) {
-          return {
-            id: item.id,
-            taskId: item.taskId,
-            status: 'downloaded',
-            filename: inTargetDir.filename,
-            inHistory
-          };
-        }
 
         if (matches.length > 0) {
           return {
             id: item.id,
             taskId: item.taskId,
-            status: 'wrong-location',
+            status: 'downloaded',
             filename: matches[0].filename,
             inHistory
           };
