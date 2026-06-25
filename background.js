@@ -5,10 +5,8 @@ chrome.runtime.onInstalled.addListener(() => {
 
 // 下载历史记录，避免重复下载
 const DOWNLOAD_HISTORY_KEY = 'cnkiScholarDownloadHistory';
-const PENDING_NATIVE_DOWNLOAD_TTL = 2 * 60 * 1000;
 const downloadHistory = new Set();
 const activeDownloads = new Map();
-const pendingNativeDownloads = [];
 
 const historyReady = new Promise(resolve => chrome.storage.local.get({ [DOWNLOAD_HISTORY_KEY]: [] }, (result) => {
   const history = result[DOWNLOAD_HISTORY_KEY] || [];
@@ -39,61 +37,6 @@ function isHtmlDownload(download) {
     /\.(html?|shtml)$/.test(basename(download?.filename)) ||
     (download?.mime || '').toLowerCase().includes('text/html')
   );
-}
-
-function findExistingPdfDownload(expectedFilename) {
-  return new Promise(resolve => {
-    const expectedPath = normalizePath(expectedFilename);
-    const expectedName = basename(expectedPath);
-    const expectedDir = expectedPath.split('/').slice(0, -1).join('/');
-    if (!expectedName) {
-      resolve(null);
-      return;
-    }
-
-    chrome.downloads.search({}, downloads => {
-      const records = Array.isArray(downloads) ? downloads : [];
-      const matches = records.filter(record => {
-        if (record.exists === false || isHtmlDownload(record)) return false;
-        return basename(record.filename) === expectedName;
-      });
-
-      const inExpectedDir = matches.find(record => {
-        const filename = normalizePath(record.filename);
-        return expectedDir && filename.includes(`/${expectedDir}/`);
-      });
-
-      resolve(inExpectedDir || matches[0] || null);
-    });
-  });
-}
-
-function cleanupPendingNativeDownloads() {
-  const now = Date.now();
-  for (let index = pendingNativeDownloads.length - 1; index >= 0; index--) {
-    if (now - pendingNativeDownloads[index].createdAt > PENDING_NATIVE_DOWNLOAD_TTL) {
-      pendingNativeDownloads.splice(index, 1);
-    }
-  }
-}
-
-function isLikelyCnkiDownload(downloadItem) {
-  const url = `${downloadItem?.url || ''} ${downloadItem?.finalUrl || ''} ${downloadItem?.referrer || ''}`.toLowerCase();
-  return url.includes('cnki.net');
-}
-
-function takePendingNativeDownload(downloadItem) {
-  cleanupPendingNativeDownloads();
-  if (pendingNativeDownloads.length === 0 || !isLikelyCnkiDownload(downloadItem)) return null;
-
-  const itemUrl = normalizePath(downloadItem?.url || downloadItem?.finalUrl || '');
-  const index = pendingNativeDownloads.findIndex(pending => {
-    const pendingUrl = normalizePath(pending.url);
-    return itemUrl && pendingUrl && (itemUrl === pendingUrl || itemUrl.includes(pendingUrl) || pendingUrl.includes(itemUrl));
-  });
-
-  const pendingIndex = index >= 0 ? index : 0;
-  return pendingNativeDownloads.splice(pendingIndex, 1)[0];
 }
 
 function notifyDownloadState(downloadId, state, active, error) {
@@ -204,41 +147,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   // 处理文件下载请求
-  if (request.action === 'prepareNativeDownload') {
-    historyReady.then(() => {
-      const { url, filename, articleKey } = request;
-      const historyKeys = buildHistoryKeys({ url, filename, articleKey });
-      cleanupPendingNativeDownloads();
-
-      findExistingPdfDownload(filename).then(existingDownload => {
-        if (existingDownload) {
-          historyKeys.forEach(key => downloadHistory.add(key));
-          saveDownloadHistory();
-          sendResponse({ skipped: true, reason: '已下载', filename: existingDownload.filename });
-          return;
-        }
-
-        pendingNativeDownloads.push({ url, filename, articleKey, historyKeys, createdAt: Date.now() });
-        sendResponse({ ok: true });
-      }).catch(error => {
-        sendResponse({ error: error.message });
-      });
-    });
-    return true;
-  }
-
-  if (request.action === 'cancelNativeDownload') {
-    const articleKey = request.articleKey;
-    for (let index = pendingNativeDownloads.length - 1; index >= 0; index--) {
-      if (!articleKey || pendingNativeDownloads[index].articleKey === articleKey) {
-        pendingNativeDownloads.splice(index, 1);
-      }
-    }
-    sendResponse({ ok: true });
-    return true;
-  }
-
-  // 处理旧版文件下载请求
   if (request.action === 'download') {
     historyReady.then(() => {
       const { url, filename, articleKey } = request;
@@ -312,15 +220,4 @@ chrome.downloads.onChanged.addListener((delta) => {
 
     notifyDownloadState(delta.id, delta.state.current, active);
   }
-});
-
-chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
-  const pending = takePendingNativeDownload(downloadItem);
-  if (!pending) {
-    suggest();
-    return;
-  }
-
-  activeDownloads.set(downloadItem.id, pending);
-  suggest({ filename: pending.filename, conflictAction: 'uniquify' });
 });
