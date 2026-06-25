@@ -471,7 +471,7 @@ function checkDownloadedFiles(items) {
 }
 
 /**
- * 获取文章页面的 PDF/DOI/来源链接
+ * 获取文章页面的 PDF/CAJ 下载链接
  */
 async function fetchPdfUrl(articleUrl, row) {
   try {
@@ -485,28 +485,7 @@ async function fetchPdfUrl(articleUrl, row) {
 
     const doc = new DOMParser().parseFromString(text, 'text/html');
 
-    // 1. DOI 链接
-    const doiLink = doc.querySelector('a[href*="doi.org"], a[href*="dx.doi.org"]');
-    if (doiLink?.href) {
-      try {
-        const url = new URL(doiLink.href);
-        if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
-      } catch {}
-    }
-
-    // 2. "全部来源"链接
-    const sourceLinks = doc.querySelectorAll(
-      '.detail_doc-database-content__3nYOl .detail_doc-database-link__7ovGD a'
-    );
-    for (const sl of sourceLinks) {
-      if (!sl?.href) continue;
-      try {
-        const url = new URL(sl.href.trim().replace(/^`|`$/g, ''), articleUrl);
-        if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
-      } catch {}
-    }
-
-    // 3. PDF/CAJ 下载按钮
+    // PDF/CAJ 下载按钮
     const isThesis = row?.querySelector('img[src*="thesis"]') || articleUrl.includes('CDMD');
 
     if (isThesis) {
