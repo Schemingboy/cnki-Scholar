@@ -2,8 +2,6 @@
 
 知网（CNKI）批量下载扩展。在检索结果页勾选文献后按可控间隔逐篇下载 PDF，顺带给期刊名标注分区和影响因子、鼠标悬停看摘要。
 
-本项目基于 [fenqijun/cnki-Scholar](https://github.com/fenqijun/cnki-Scholar) 改造，核心目标是「点了下载就真的能下」，所有花哨能力都退到辅助位置。
-
 ---
 
 ## 设计原则
