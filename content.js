@@ -1,5 +1,5 @@
 // ============================================================
-// cnki-Scholar v1.3 — 知网增强插件 (重构版)
+// cnki-batch-download v1.3 — 知网批量下载扩展
 // 功能: PDF下载 | 摘要悬停 | 期刊标签 | 批量下载
 // ============================================================
 
@@ -385,7 +385,7 @@ async function addPdfDownloadButtons() {
           alert('无法获取PDF下载链接');
         }
       } catch (error) {
-        console.error('[cnki-Scholar] 获取PDF链接失败:', error);
+        console.error('[cnki-batch-download] 获取PDF链接失败:', error);
         alert('获取PDF链接失败: ' + error.message);
       } finally {
         downloadBtn.textContent = '下载';
@@ -476,7 +476,7 @@ async function fetchPdfUrl(articleUrl, row) {
     return null;
   } catch (error) {
     if (error?.message === CAPTCHA_REQUIRED) throw error;
-    console.error(`[cnki-Scholar] fetchPdfUrl 失败 (${articleUrl}):`, error);
+    console.error(`[cnki-batch-download] fetchPdfUrl 失败 (${articleUrl}):`, error);
     return null;
   }
 }
@@ -521,7 +521,7 @@ async function fetchKeywords(articleUrl, container) {
       container.appendChild(tag);
     });
   } catch (error) {
-    console.error('[cnki-Scholar] 获取关键词出错:', error);
+    console.error('[cnki-batch-download] 获取关键词出错:', error);
   }
 }
 
@@ -599,14 +599,14 @@ async function processJournalTags() {
 
     const journalsData = journalCache.data;
     if (!journalsData) {
-      console.warn('[cnki-Scholar] 期刊数据为空，跳过标签渲染');
+      console.warn('[cnki-batch-download] 期刊数据为空，跳过标签渲染');
       return;
     }
-    console.log(`[cnki-Scholar] 开始处理期刊标签，数据量: ${journalsData.length}`);
+    console.log(`[cnki-batch-download] 开始处理期刊标签，数据量: ${journalsData.length}`);
 
     // 搜索结果页：遍历来源单元格
     const sourceElements = document.querySelectorAll(SELECTORS.sourceCells);
-    console.log(`[cnki-Scholar] 找到 ${sourceElements.length} 个期刊元素`);
+    console.log(`[cnki-batch-download] 找到 ${sourceElements.length} 个期刊元素`);
 
     sourceElements.forEach(element => {
       if (element.querySelector('.journal-tag-container')) return;
@@ -649,7 +649,7 @@ async function processJournalTags() {
       }
     }
   } catch (error) {
-    console.error('[cnki-Scholar] 处理期刊标签时出错:', error);
+    console.error('[cnki-batch-download] 处理期刊标签时出错:', error);
   }
 }
 
@@ -671,19 +671,19 @@ async function fetchJournalData(url) {
     });
 
     if (error || !data) {
-      console.error('[cnki-Scholar] 远程数据获取失败:', error);
-      console.warn('[cnki-Scholar] 回退到本地默认数据');
+      console.error('[cnki-batch-download] 远程数据获取失败:', error);
+      console.warn('[cnki-batch-download] 回退到本地默认数据');
       return DEFAULT_JOURNALS_DATA;
     }
 
     if (Array.isArray(data) && data.length > 0) {
-      console.log(`[cnki-Scholar] 成功加载 ${data.length} 条期刊数据`);
+      console.log(`[cnki-batch-download] 成功加载 ${data.length} 条期刊数据`);
       return data;
     }
     throw new Error('无效的数据格式');
   } catch (error) {
-    console.error('[cnki-Scholar] fetchJournalData 失败:', error);
-    console.warn('[cnki-Scholar] 回退到本地默认数据');
+    console.error('[cnki-batch-download] fetchJournalData 失败:', error);
+    console.warn('[cnki-batch-download] 回退到本地默认数据');
     return DEFAULT_JOURNALS_DATA;
   }
 }
@@ -937,7 +937,7 @@ class BatchDownloadManager {
     try {
       await this._checkSelectedDownloads();
     } catch (error) {
-      console.error('[cnki-Scholar] 核查失败:', error);
+      console.error('[cnki-batch-download] 核查失败:', error);
       this.statsEl.textContent = '核查失败';
       this.statsDetail.textContent = error.message || '请重新加载扩展后再试';
     } finally {
@@ -1042,7 +1042,7 @@ class BatchDownloadManager {
     try {
       await this._checkSelectedDownloads();
     } catch (error) {
-      console.error('[cnki-Scholar] 下载前核查失败:', error);
+      console.error('[cnki-batch-download] 下载前核查失败:', error);
       this.statsEl.textContent = '核查失败，继续下载未完成项';
     }
 
@@ -1226,7 +1226,7 @@ function addDownloadAllButton() {
 
 // ========== 初始化 ==========
 
-document.addEventListener('DOMContentLoaded', () => {
+function init() {
   if (!window.location.hostname.includes('cnki.net')) return;
 
   // 表格左对齐
@@ -1242,7 +1242,15 @@ document.addEventListener('DOMContentLoaded', () => {
   addPdfDownloadButtons();
   addHoverForAbstracts();
   addDownloadAllButton();
-});
+}
+
+// content script 默认 run_at 为 document_idle，常晚于 DOMContentLoaded，
+// 只挂监听会永不触发。
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}
 
 // 监听动态加载（防抖）
 let processing = false;

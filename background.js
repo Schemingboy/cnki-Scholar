@@ -1,6 +1,6 @@
-// cnki-Scholar 后台脚本 - 处理跨域请求和文件下载
+// cnki-batch-download 后台脚本 - 处理跨域请求和文件下载
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('[cnki-Scholar] 插件已安装/更新 v1.3');
+  console.log('[cnki-batch-download] 插件已安装/更新 v1.3');
 });
 
 // 下载历史记录，避免重复下载
@@ -84,7 +84,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     function attemptFetch() {
       attempts++;
-      console.log(`[cnki-Scholar] 第${attempts}次请求: ${request.url}`);
+      console.log(`[cnki-batch-download] 第${attempts}次请求: ${request.url}`);
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 60000);
@@ -98,12 +98,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           return response.json();
         })
         .then(data => {
-          console.log(`[cnki-Scholar] 数据获取成功，共${data.length}条`);
+          console.log(`[cnki-batch-download] 数据获取成功，共${data.length}条`);
           sendResponse({ data });
         })
         .catch(error => {
           clearTimeout(timeoutId);
-          console.error(`[cnki-Scholar] 第${attempts}次请求失败:`, error.message);
+          console.error(`[cnki-batch-download] 第${attempts}次请求失败:`, error.message);
           if (attempts < maxRetries) {
             setTimeout(attemptFetch, 1000);
           } else {
